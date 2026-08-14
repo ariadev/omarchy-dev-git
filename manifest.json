@@ -2,30 +2,50 @@
   "schemaVersion": 1,
   "id": "dev.git",
   "name": "Git",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "author": "ariadev",
   "license": "MIT",
-  "description": "GitHub and GitLab open work: activity streaks, review queue, and your open pull/merge requests in a native Omarchy bar panel.",
-  "kinds": ["bar-widget"],
+  "description": "GitHub and GitLab open work: a full-year contribution graph, review queue, and your open pull/merge requests in a native Omarchy bar panel.",
+  "kinds": [
+    "bar-widget"
+  ],
   "activation": "on-demand",
   "entryPoints": {
     "barWidget": "Panel.qml"
   },
   "barWidget": {
     "displayName": "Git",
-    "description": "One bar icon and one panel: per-provider activity streak, a grid of review/assignment counts, and click-to-open queues of merge requests and issues.",
+    "description": "One bar icon and one panel: per-provider full-year activity graph, a grid of review/assignment counts, and click-to-open queues of merge requests and issues. Multiple hosts per provider (GitHub Enterprise, self-managed GitLab) switch inside the tab.",
     "category": "Dev",
-    "aliases": ["git", "github", "gitlab", "merge-requests"],
+    "aliases": [
+      "git",
+      "github",
+      "gitlab",
+      "merge-requests",
+      "pull-requests"
+    ],
     "allowMultiple": false,
     "defaults": {
       "providers": {
-        "github": { "enabled": true },
-        "gitlab": { "enabled": true }
+        "github": {
+          "enabled": true
+        },
+        "gitlab": {
+          "enabled": true
+        }
       },
       "refreshIntervalSec": 300
     },
     "schema": [
-      { "key": "refreshIntervalSec", "type": "integer", "label": "Refresh interval (seconds)", "min": 30, "max": 3600, "step": 30, "defaultValue": 300 }
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 300
+      }
     ]
   }
 }

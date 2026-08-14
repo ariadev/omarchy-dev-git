@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Build-on-demand launcher for the Go collector.
+#
+# The plugin ships source, not a binary: Omarchy installs plugins with a plain
+# `git clone`, so there is no install hook to compile in and no safe way to
+# ship a prebuilt artifact for someone else's machine. This script keeps that
+# invisible — it compiles once into bin/gitwork.bin (gitignored), then execs it
+# directly on every later run, so the steady-state cost is one exec.
+
+set -euo pipefail
+
+plugin_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+src_dir="$plugin_dir/gitwork"
+binary="$plugin_dir/bin/gitwork.bin"
+
+die() {
+  echo "gitwork: $*" >&2
+  exit 1
+}
+
+# The binary is stale whenever any source file is newer than it.
+needs_build() {
+  [[ -x $binary ]] || return 0
+  local newer
+  newer=$(find "$src_dir" -name '*.go' -newer "$binary" -print -quit 2>/dev/null || true)
+  [[ -n $newer ]] || [[ $src_dir/go.mod -nt $binary ]]
+}
+
+# Go is a build-time dependency only, and it is commonly installed somewhere
+# the shell's PATH does not reach (mise, asdf, a manual /usr/local/go).
+#
+# Every candidate is probed with `go version` rather than trusted for being
+# executable: a version-manager shim on PATH resolves happily and then fails at
+# run time when no version is pinned, which would strand us on a `go` that can
+# never build anything while a real toolchain sits one directory away.
+find_go() {
+  local candidate
+  for candidate in \
+    "$(command -v go 2>/dev/null || true)" \
+    /usr/local/go/bin/go \
+    /usr/lib/go/bin/go \
+    "$HOME/go/bin/go" \
+    "$HOME"/.local/share/mise/installs/go/*/bin/go \
+    "$HOME"/.asdf/installs/golang/*/go/bin/go; do
+    [[ -n $candidate && -x $candidate ]] || continue
+    if "$candidate" version >/dev/null 2>&1; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if needs_build; then
+  go_bin=$(find_go) || die "needs the Go toolchain to build the collector once. Install it (e.g. \`sudo pacman -S go\`) and reopen the panel."
+  mkdir -p "$plugin_dir/bin"
+  # Stdlib-only, no module downloads: this builds offline and takes ~1s.
+  # Built from inside the module so the surrounding plugin repo (which has no
+  # go.mod of its own) never gets mistaken for the main module.
+  (cd "$src_dir" && GOFLAGS= GOPROXY=off "$go_bin" build -trimpath -buildvcs=false \
+    -ldflags "-s -w" -o "$binary" .) >&2 || die "could not build the collector; see the error above."
+fi
+
+exec "$binary" "$@"

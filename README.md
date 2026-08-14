@@ -1,26 +1,35 @@
 # dev.git — Git dashboard bar widget for Omarchy
 
-A native [Omarchy](https://opencode.ai) shell bar widget that watches GitHub and
-GitLab for open work: activity streaks, review queues, and your own pull and
-merge requests, all in one panel.
+A native [Omarchy](https://omarchy.org) shell bar widget that watches GitHub and
+GitLab for open work: a full-year contribution graph, review queues, and your
+own pull and merge requests, all in one panel.
 
 ## Features
 
-- Per-provider activity streak: last 7 days, current run, longest run, total contributions
-- A grid of open-work counts: awaiting review, assigned PRs/MRs, assigned issues, authored issues
-- Click a count to open the pre-filtered queue page in your browser
-- "Awaiting review" list and "My open PRs/MRs" list, each row clickable
-- Multiple GitLab instances supported side by side (one entry per configured host)
-- Keyboard navigation: `j`/`k` rows, `h`/`l` provider, `Enter` open, `r` refresh, `Tab` switch panel
-- Left click toggles the panel, middle click cycles providers, right click refreshes
+- **Full-year activity graph** — the trailing 53 weeks, quartile-shaded, with
+  per-day tooltips, month and weekday axes, current/longest streak and today's
+  count
+- **One tab per provider** — the tabs read `GitHub` and `GitLab`, never a
+  hostname; multiple hosts live in a host switch inside the tab
+- **Multiple hosts per provider** — GitHub Enterprise and self-managed GitLab
+  instances are discovered from `gh` and `glab` config, each with its own
+  identity, graph and queues. The panel opens on a signed-in host and shows the
+  exact sign-in command for the ones that aren't.
+- A grid of open-work counts: awaiting review, assigned PRs/MRs, assigned
+  issues, authored issues — each click opens the pre-filtered queue page
+- Queue lists with per-row state: draft tag, approval check, comment count,
+  repository, number and age
+- A dot on the bar icon when something is waiting on your review
+- Keyboard driven throughout (see below)
 
 ## Requirements
 
 - [gh](https://cli.github.com/) authenticated with `gh auth login`
 - [glab](https://gitlab.com/gitlab-org/cli) authenticated with `glab auth login`
+- [Go](https://go.dev) — build-time only, used once to compile the collector
 
-Both are optional: GitHub and each GitLab host are collected independently, so
-a missing or unauthenticated provider never hides the others.
+Both CLIs are optional: GitHub and each GitLab host are collected
+independently, so a missing or unauthenticated provider never hides the others.
 
 ## Install
 
@@ -35,27 +44,58 @@ omarchy plugin enable dev.git
 omarchy bar put dev.git --after omarchy.agents
 ```
 
+## Keyboard
+
+| Key           | Action                          |
+|---------------|---------------------------------|
+| `j` / `k`     | Move down / up the queue rows   |
+| `h` / `l`     | Previous / next provider tab    |
+| `[` / `]`     | Previous / next host            |
+| `g` / `G`     | First / last row                |
+| `Enter`       | Open the selected row           |
+| `r`           | Refresh now                     |
+| `Tab`         | Switch to the neighbouring panel|
+| `Esc`         | Close                           |
+
+Left click toggles the panel, middle click cycles providers, right click
+refreshes.
+
 ## How it works
 
-The widget runs `gitwork.py` on a timer (default every 300 s) and reads the
-JSON it writes to `~/.local/state/omarchy/git/overview.json`. Data is collected
-via the `gh` and `glab` CLIs:
+The widget runs the collector in `bin/gitwork` on a timer (default every 300 s)
+and reads the JSON it writes to `~/.local/state/omarchy/git/overview.json`.
 
-- GitHub: search API for review-requested/assigned/authored PRs and issues,
-  GraphQL contribution calendar for the streak
-- GitLab: GraphQL `currentUser` MR queues with a REST fallback, REST for
-  issues, user events for the streak
+The collector is a small Go program in `gitwork/`. It never stores a token of
+its own: it asks `gh auth token` / `glab config get token` for the credentials
+you already authenticated with, then talks to each API directly.
 
-No tokens or secrets are stored by the plugin; it only uses the CLIs you have
-already authenticated.
+- **GitHub** — one GraphQL request per host covers identity, the contribution
+  calendar and all five open-work queues.
+- **GitLab** — one GraphQL request for identity and the merge-request queues,
+  REST for issues, and the events feed for the contribution calendar (GitLab
+  has no calendar API). Page one of the feed reports the page count, so the
+  rest are fetched concurrently.
+
+Every host runs concurrently over one shared HTTP transport, so a run costs the
+slowest single host rather than the sum of all of them.
+
+`bin/gitwork` is a launcher: it compiles `gitwork/` into `bin/gitwork.bin` the
+first time it runs (and again whenever the sources change), then execs it
+directly. The build is stdlib-only — no module downloads, and it works offline.
+Omarchy installs plugins with a plain `git clone` and has no install hook, so
+this is how a compiled collector stays invisible to the user. To pre-build:
+
+```bash
+cd gitwork && go build -o ../bin/gitwork.bin .
+```
 
 ## Settings
 
-| Key                | Type    | Default | Description                       |
-|--------------------|---------|---------|-----------------------------------|
-| `refreshIntervalSec` | integer | 300     | Collector run interval in seconds |
-| `providers.github.enabled`  | boolean | true | Show the GitHub provider |
-| `providers.gitlab.enabled`  | boolean | true | Show GitLab providers |
+| Key                         | Type    | Default | Description                       |
+|-----------------------------|---------|---------|-----------------------------------|
+| `refreshIntervalSec`        | integer | 300     | Collector run interval in seconds |
+| `providers.github.enabled`  | boolean | true    | Show the GitHub tab               |
+| `providers.gitlab.enabled`  | boolean | true    | Show the GitLab tab               |
 
 ## License
 
