@@ -8,31 +8,17 @@ own pull and merge requests, all in one panel.
 
 ## Features
 
-- **Full-year activity graph** — the trailing 53 weeks, quartile-shaded, with
-  per-day tooltips, month and weekday axes, current/longest streak and today's
-  count
-- **One tab per provider** — the tabs read `GitHub` and `GitLab`, never a
-  hostname; multiple hosts live in a host switch inside the tab
+- **Full-year activity graph** — trailing 53 weeks, quartile-shaded, with
+  per-day tooltips, streaks and today's count
 - **Multiple hosts per provider** — GitHub Enterprise and self-managed GitLab
-  instances are discovered from `gh` and `glab` config, each with its own
-  identity, graph and queues. The panel opens on a signed-in host and shows the
-  exact sign-in command for the ones that aren't.
-- A grid of open-work counts: awaiting review, assigned PRs/MRs, assigned
-  issues, authored issues — each click opens the pre-filtered queue page
-- Queue lists with per-row state: draft tag, approval check, comment count,
-  repository, number and age
+  are discovered from `gh`/`glab` config, each with its own identity, graph and
+  queues, behind a host switch inside the tab
+- **Open-work grid** — awaiting review, assigned PRs/MRs, assigned and authored
+  issues; each click opens the pre-filtered queue page
+- **Queue rows** carrying draft tag, approval check, comment count, repository,
+  number and age
 - A dot on the bar icon when something is waiting on your review
-- Keyboard driven throughout (see below)
-
-## Requirements
-
-- `curl` and `jq` — the collector is built on them
-- [gh](https://cli.github.com/) authenticated with `gh auth login`
-- [glab](https://gitlab.com/gitlab-org/cli) authenticated with `glab auth login`
-
-Nothing is compiled or installed: clone the plugin and it runs. Both CLIs are
-optional — GitHub and each GitLab host are collected independently, so a
-missing or unauthenticated provider never hides the others.
+- Keyboard driven throughout
 
 ## Install
 
@@ -40,54 +26,66 @@ missing or unauthenticated provider never hides the others.
 omarchy plugin add https://github.com/ariadev/omarchy-dev-git.git --enable --yes
 ```
 
-Or clone into your config by hand and enable it:
+Needs `curl` and `jq`, plus [gh](https://cli.github.com/) and/or
+[glab](https://gitlab.com/gitlab-org/cli) signed in — the collector reads the
+credentials those CLIs already hold and never stores a token of its own. Both
+are optional: each provider is collected independently, so a missing or
+unauthenticated one never hides the others.
 
-```bash
-omarchy plugin enable dev.git
-omarchy bar put dev.git --after omarchy.agents
-```
+Nothing is compiled or installed. Clone it and it runs.
 
 ## Keyboard
 
-| Key           | Action                          |
-|---------------|---------------------------------|
-| `j` / `k`     | Move down / up the queue rows   |
-| `h` / `l`     | Previous / next provider tab    |
-| `[` / `]`     | Previous / next host            |
-| `g` / `G`     | First / last row                |
-| `Enter`       | Open the selected row           |
-| `r`           | Refresh now                     |
-| `Tab`         | Switch to the neighbouring panel|
-| `Esc`         | Close                           |
+| Key       | Action                        |
+|-----------|-------------------------------|
+| `j` / `k` | Move down / up the queue rows |
+| `h` / `l` | Previous / next provider tab  |
+| `[` / `]` | Previous / next host          |
+| `g` / `G` | First / last row              |
+| `Enter`   | Open the selected row         |
+| `r`       | Refresh now                   |
+| `Tab`     | Neighbouring panel            |
+| `Esc`     | Close                         |
 
 Left click toggles the panel, middle click cycles providers, right click
 refreshes.
 
+### Open it from a keybinding
+
+The panel exposes an IPC target, so it can be bound to a key. Add to
+`~/.config/hypr/bindings.lua`:
+
+```lua
+o.bind("SUPER + CTRL + G", "Git dashboard", "omarchy-shell dev.git toggle")
+```
+
+`toggle`, `open`, `close`, `refresh` and `next` (cycle provider) are all
+available — `omarchy-shell dev.git refresh` refreshes without opening.
+
 ## How it works
 
-The widget runs the collector in `bin/gitwork` on a timer (default every 300 s)
-and reads the JSON it writes to `~/.local/state/omarchy/git/overview.json`.
+`bin/gitwork` runs on a timer (default 300 s) and writes one JSON overview to
+`~/.local/state/omarchy/git/overview.json`, which the panel watches. It is a
+bash script with its JSON transforms in `bin/gitwork.jq`.
 
-The collector is `bin/gitwork`, a bash script with its JSON transforms in
-`bin/gitwork.jq`. Nothing is compiled or installed: clone the plugin and it
-runs. It never stores a token of its own — it asks `gh auth token` /
-`glab config get token` for the credentials you already authenticated with,
-then talks to each API directly with `curl`.
+GitHub needs one GraphQL request per host for identity, calendar and all five
+queues. GitLab takes one GraphQL request for identity and merge requests, REST
+for issues, and the events feed for the calendar — it has no calendar API — with
+page one reporting the page count so the rest are fetched together.
 
-- **GitHub** — one GraphQL request per host covers identity, the contribution
-  calendar and all five open-work queues.
-- **GitLab** — one GraphQL request for identity and the merge-request queues,
-  REST for issues, and the events feed for the contribution calendar (GitLab
-  has no calendar API). Page one of the feed reports the page count, so the
-  rest are fetched concurrently.
-
-Every host is collected in its own subshell and lands in its own temp file, so
-a run costs the slowest single host rather than the sum of all of them, and one
-unreachable instance never hides the others — it just carries its own sign-in
-hint into the panel. When a host cannot be reached, its last good record is
-carried forward for up to six hours and marked stale, so a dropped VPN does not
+Every host is collected in its own subshell, so a run costs the slowest single
+host rather than the sum of them. A host that cannot be reached carries its last
+good record forward for up to six hours, marked stale, so a dropped VPN does not
 blank a working dashboard. An authentication failure is not carried: that data
 is genuinely gone.
+
+## Settings
+
+| Key                        | Type    | Default | Description                |
+|----------------------------|---------|---------|----------------------------|
+| `refreshIntervalSec`       | integer | 300     | Collector run interval (s) |
+| `providers.github.enabled` | boolean | true    | Show the GitHub tab        |
+| `providers.gitlab.enabled` | boolean | true    | Show the GitLab tab        |
 
 ## Tests
 
@@ -97,14 +95,6 @@ is genuinely gone.
 
 No network or credentials required — every host the suite touches is
 deliberately unreachable.
-
-## Settings
-
-| Key                         | Type    | Default | Description                       |
-|-----------------------------|---------|---------|-----------------------------------|
-| `refreshIntervalSec`        | integer | 300     | Collector run interval in seconds |
-| `providers.github.enabled`  | boolean | true    | Show the GitHub tab               |
-| `providers.gitlab.enabled`  | boolean | true    | Show the GitLab tab               |
 
 ## License
 
