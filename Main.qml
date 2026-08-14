@@ -2,8 +2,8 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// Data side of the git bar widget. Collection lives entirely in the Go
-// collector under gitwork/, which writes one JSON overview covering every
+// Data side of the git bar widget. Collection lives entirely in the
+// collector at bin/gitwork, which writes one JSON overview covering every
 // configured host; this file runs it on a schedule, watches the file it
 // writes, and exposes the records grouped the way the panel presents them:
 // one group per provider (GitHub, GitLab), each holding one or more hosts.
@@ -32,8 +32,8 @@ Item {
   property int refreshIntervalSec: Math.max(30, Number(setting("refreshIntervalSec", 300)) || 300)
   property double lastRunMs: 0
 
-  // Surfaced verbatim in the panel: the collector builds itself on first run,
-  // so "install Go" or a compile error has to reach the user somehow.
+  // Surfaced verbatim in the panel: a missing `curl` or `jq` stops the
+  // collector before it can report anything itself.
   property string collectorError: ""
 
   readonly property bool loading: updateProcess.running
@@ -73,9 +73,9 @@ Item {
     id: updateProcess
     running: false
 
-    // Kept out of `collectorError` until the exit code says it matters: the
-    // collector compiles itself on first run, and Go writes progress chatter
-    // to stderr even when that build succeeds.
+    // Kept out of `collectorError` until the exit code says it matters:
+    // curl can write transient chatter to stderr on a run that still
+    // produces a usable overview.
     property string errorText: ""
 
     onRunningChanged: if (running) errorText = ""

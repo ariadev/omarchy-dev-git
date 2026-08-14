@@ -4,6 +4,8 @@ A native [Omarchy](https://omarchy.org) shell bar widget that watches GitHub and
 GitLab for open work: a full-year contribution graph, review queues, and your
 own pull and merge requests, all in one panel.
 
+![The dev.git panel showing the GitHub and GitLab tabs side by side](preview.png)
+
 ## Features
 
 - **Full-year activity graph** — the trailing 53 weeks, quartile-shaded, with
@@ -24,12 +26,13 @@ own pull and merge requests, all in one panel.
 
 ## Requirements
 
+- `curl` and `jq` — the collector is built on them
 - [gh](https://cli.github.com/) authenticated with `gh auth login`
 - [glab](https://gitlab.com/gitlab-org/cli) authenticated with `glab auth login`
-- [Go](https://go.dev) — build-time only, used once to compile the collector
 
-Both CLIs are optional: GitHub and each GitLab host are collected
-independently, so a missing or unauthenticated provider never hides the others.
+Nothing is compiled or installed: clone the plugin and it runs. Both CLIs are
+optional — GitHub and each GitLab host are collected independently, so a
+missing or unauthenticated provider never hides the others.
 
 ## Install
 
@@ -65,9 +68,11 @@ refreshes.
 The widget runs the collector in `bin/gitwork` on a timer (default every 300 s)
 and reads the JSON it writes to `~/.local/state/omarchy/git/overview.json`.
 
-The collector is a small Go program in `gitwork/`. It never stores a token of
-its own: it asks `gh auth token` / `glab config get token` for the credentials
-you already authenticated with, then talks to each API directly.
+The collector is `bin/gitwork`, a bash script with its JSON transforms in
+`bin/gitwork.jq`. Nothing is compiled or installed: clone the plugin and it
+runs. It never stores a token of its own — it asks `gh auth token` /
+`glab config get token` for the credentials you already authenticated with,
+then talks to each API directly with `curl`.
 
 - **GitHub** — one GraphQL request per host covers identity, the contribution
   calendar and all five open-work queues.
@@ -76,18 +81,22 @@ you already authenticated with, then talks to each API directly.
   has no calendar API). Page one of the feed reports the page count, so the
   rest are fetched concurrently.
 
-Every host runs concurrently over one shared HTTP transport, so a run costs the
-slowest single host rather than the sum of all of them.
+Every host is collected in its own subshell and lands in its own temp file, so
+a run costs the slowest single host rather than the sum of all of them, and one
+unreachable instance never hides the others — it just carries its own sign-in
+hint into the panel. When a host cannot be reached, its last good record is
+carried forward for up to six hours and marked stale, so a dropped VPN does not
+blank a working dashboard. An authentication failure is not carried: that data
+is genuinely gone.
 
-`bin/gitwork` is a launcher: it compiles `gitwork/` into `bin/gitwork.bin` the
-first time it runs (and again whenever the sources change), then execs it
-directly. The build is stdlib-only — no module downloads, and it works offline.
-Omarchy installs plugins with a plain `git clone` and has no install hook, so
-this is how a compiled collector stays invisible to the user. To pre-build:
+## Tests
 
 ```bash
-cd gitwork && go build -o ../bin/gitwork.bin .
+./tests/run.sh
 ```
+
+No network or credentials required — every host the suite touches is
+deliberately unreachable.
 
 ## Settings
 

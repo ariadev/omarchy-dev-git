@@ -1,64 +1,626 @@
 #!/usr/bin/env bash
-# Build-on-demand launcher for the Go collector.
+# Collect GitHub and GitLab open work into one JSON overview for the dev.git
+# Omarchy bar plugin.
 #
-# The plugin ships source, not a binary: Omarchy installs plugins with a plain
-# `git clone`, so there is no install hook to compile in and no safe way to
-# ship a prebuilt artifact for someone else's machine. This script keeps that
-# invisible — it compiles once into bin/gitwork.bin (gitignored), then execs it
-# directly on every later run, so the steady-state cost is one exec.
+# Nothing here is built or installed: the plugin is dropped in and runs. The
+# only requirements are curl and jq, plus whichever of `gh`/`glab` already
+# holds your credentials — the same CLIs the panel already assumed.
+#
+# Every host is collected concurrently in its own subshell and lands in its own
+# temp file, so one unreachable or unauthenticated instance never hides the
+# others; it just carries its own sign-in hint into the panel.
 
-set -euo pipefail
+set -uo pipefail
 
-plugin_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-src_dir="$plugin_dir/gitwork"
-binary="$plugin_dir/bin/gitwork.bin"
+readonly SCHEMA_VERSION=3
+readonly STALE_WINDOW_SEC=$((6 * 3600))
+readonly GITLAB_PAGE_CAP=40
+LIB_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+readonly LIB_DIR
 
-die() {
-  echo "gitwork: $*" >&2
+output=""
+pretty=true
+req_timeout=45
+
+usage() {
+  cat <<'EOF'
+Usage: gitwork [options]
+  -output PATH      Write the overview JSON here (default: stdout)
+  -timeout SECONDS  Per-request deadline (default: 45)
+  -pretty BOOL      Indent the JSON output (default: true)
+EOF
+}
+
+while (($#)); do
+  case "$1" in
+    -output|--output) [[ $# -ge 2 ]] || { echo "missing value for $1" >&2; exit 2; }; output=$2; shift 2 ;;
+    -timeout|--timeout) [[ $# -ge 2 ]] || { echo "missing value for $1" >&2; exit 2; }; req_timeout=${2%s}; shift 2 ;;
+    -pretty|--pretty) [[ $# -ge 2 ]] || { echo "missing value for $1" >&2; exit 2; }; pretty=$2; shift 2 ;;
+    -pretty=*|--pretty=*) pretty=${1#*=}; shift ;;
+    -output=*|--output=*) output=${1#*=}; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "gitwork: unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+[[ $req_timeout =~ ^[0-9]+$ ]] || req_timeout=45
+
+for tool in curl jq; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    echo "gitwork: $tool is required" >&2
+    exit 1
+  }
+done
+
+jqm() { jq -L "$LIB_DIR" "$@"; }
+
+if ! tmp=$(mktemp -d); then
+  echo "gitwork: could not create temporary storage" >&2
   exit 1
+fi
+trap 'rm -rf "$tmp"' EXIT
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+now_ms() { echo $(($(date +%s%N) / 1000000)); }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------------------
+# Host discovery
+# ---------------------------------------------------------------------------
+
+config_home() {
+  if [[ -n ${XDG_CONFIG_HOME:-} ]]; then printf '%s\n' "$XDG_CONFIG_HOME"
+  else printf '%s\n' "$HOME/.config"; fi
 }
 
-# The binary is stale whenever any source file is newer than it.
-needs_build() {
-  [[ -x $binary ]] || return 0
-  local newer
-  newer=$(find "$src_dir" -name '*.go' -newer "$binary" -print -quit 2>/dev/null || true)
-  [[ -n $newer ]] || [[ $src_dir/go.mod -nt $binary ]]
+# Scan a YAML file for mapping keys at one indentation depth, optionally only
+# inside a named parent block. Both CLIs write flat host maps, so this is
+# enough to enumerate hosts without depending on a YAML parser.
+yaml_keys_at() {
+  local path=$1 parent=$2 indent=$3
+  [[ -r $path ]] || return 0
+  awk -v parent="$parent" -v want="$indent" '
+    /\t/ { next }
+    { line = $0; sub(/[ \t\r]+$/, "", line) }
+    line == "" { next }
+    { trimmed = line; sub(/^[ ]+/, "", trimmed) }
+    trimmed ~ /^#/ { next }
+    { depth = length(line) - length(trimmed) }
+    parent != "" && depth == 0 { in_parent = (trimmed == parent ":"); next }
+    parent != "" && !in_parent { next }
+    depth != want { next }
+    trimmed ~ /^[A-Za-z0-9_.:-]+:[ \t]*(#.*)?$/ {
+      key = trimmed; sub(/:[ \t]*(#.*)?$/, "", key); print key
+    }
+  ' "$path"
 }
 
-# Go is a build-time dependency only, and it is commonly installed somewhere
-# the shell's PATH does not reach (mise, asdf, a manual /usr/local/go).
-#
-# Every candidate is probed with `go version` rather than trusted for being
-# executable: a version-manager shim on PATH resolves happily and then fails at
-# run time when no version is pinned, which would strand us on a `go` that can
-# never build anything while a real toolchain sits one directory away.
-find_go() {
-  local candidate
-  for candidate in \
-    "$(command -v go 2>/dev/null || true)" \
-    /usr/local/go/bin/go \
-    /usr/lib/go/bin/go \
-    "$HOME/go/bin/go" \
-    "$HOME"/.local/share/mise/installs/go/*/bin/go \
-    "$HOME"/.asdf/installs/golang/*/go/bin/go; do
-    [[ -n $candidate && -x $candidate ]] || continue
-    if "$candidate" version >/dev/null 2>&1; then
-      echo "$candidate"
-      return 0
+# Normalize, strip any scheme, and drop duplicates while keeping first-seen
+# order — discovery order is display order in the panel.
+dedupe() {
+  awk '{
+    v = tolower($0)
+    sub(/^https?:\/\//, "", v)
+    sub(/\/+$/, "", v)
+    if (v != "" && !(v in seen)) { seen[v] = 1; print v }
+  }'
+}
+
+order_default_first() {
+  local primary=$1 hosts=("${@:2}") host
+  for host in "${hosts[@]}"; do [[ $host == "$primary" ]] && printf '%s\n' "$host"; done
+  for host in "${hosts[@]}"; do [[ $host != "$primary" ]] && printf '%s\n' "$host"; done
+}
+
+github_hosts() {
+  local raw
+  if [[ -n ${GH_HOST:-} ]]; then printf '%s\n' "$GH_HOST" | dedupe; return; fi
+  if [[ -n ${GITHUB_HOST:-} ]]; then printf '%s\n' "$GITHUB_HOST" | dedupe; return; fi
+  raw=$(yaml_keys_at "$(config_home)/gh/hosts.yml" "" 0 | dedupe)
+  if [[ -z $raw ]] && { [[ -n ${GITHUB_TOKEN:-} ]] || have gh; }; then raw="github.com"; fi
+  [[ -n $raw ]] || return 0
+  mapfile -t hosts <<<"$raw"
+  order_default_first github.com "${hosts[@]}"
+}
+
+gitlab_hosts() {
+  local path raw
+  if [[ -n ${GITLAB_HOST:-} ]]; then printf '%s\n' "$GITLAB_HOST" | dedupe; return; fi
+  path="$(config_home)/glab-cli/config.yml"
+  raw=$(yaml_keys_at "$path" hosts 4 | dedupe)
+  [[ -n $raw ]] || raw=$(yaml_keys_at "$path" hosts 2 | dedupe)
+  if [[ -z $raw ]] && have glab; then raw="gitlab.com"; fi
+  [[ -n $raw ]] || return 0
+  mapfile -t hosts <<<"$raw"
+  order_default_first gitlab.com "${hosts[@]}"
+}
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+
+# Both helpers print the HTTP status on stdout and leave the body in $2. Auth
+# failures (401/403) are distinguished from transport errors by the caller,
+# because only the former means "sign in again".
+http_get() {
+  local url=$1 body=$2 headers=$3
+  curl -sS --max-time "$req_timeout" \
+    -o "$body" -D "$headers" -w '%{http_code}' \
+    -H 'Accept: application/json' \
+    -H 'User-Agent: omarchy-dev-git' \
+    "${AUTH_HEADER[@]}" \
+    "$url" 2>>"$ERR_FILE"
+}
+
+http_graphql() {
+  local url=$1 payload=$2 body=$3
+  curl -sS --max-time "$req_timeout" \
+    -o "$body" -w '%{http_code}' \
+    -X POST \
+    -H 'Accept: application/json' \
+    -H 'Content-Type: application/json' \
+    -H 'User-Agent: omarchy-dev-git' \
+    "${AUTH_HEADER[@]}" \
+    --data-binary "@$payload" \
+    "$url" 2>>"$ERR_FILE"
+}
+
+header_value() {
+  local file=$1 name=$2
+  tr -d '\r' <"$file" | awk -v n="$(printf '%s' "$name" | tr 'A-Z' 'a-z')" '
+    { split($0, kv, ":"); k = tolower(kv[1]) }
+    k == n { sub(/^[^:]*:[ ]*/, ""); print; exit }
+  '
+}
+
+# ---------------------------------------------------------------------------
+# Calendar window
+# ---------------------------------------------------------------------------
+
+# The start is pulled back to the Sunday on or before (today - 364) so every
+# week column is full at the front; only the current week is ever partial.
+calendar_start_epoch() {
+  local today_epoch dow
+  today_epoch=$(date -u -d "$(date -u +%Y-%m-%d) -364 days" +%s)
+  dow=$(date -u -d "@$today_epoch" +%w)
+  echo $((today_epoch - dow * 86400))
+}
+
+calendar_days() {
+  local start=$1 end
+  end=$(date -u -d "$(date -u +%Y-%m-%d)" +%s)
+  echo $(((end - start) / 86400 + 1))
+}
+
+CAL_START=$(calendar_start_epoch)
+CAL_DAYS=$(calendar_days "$CAL_START")
+
+# ---------------------------------------------------------------------------
+# GitHub
+# ---------------------------------------------------------------------------
+
+# One query covers the whole provider: identity, the trailing-year calendar,
+# and all five open-work queues. GitHub bills this as a single point of rate
+# limit and answers in one round trip.
+read -r -d '' GITHUB_QUERY <<'GQL'
+query {
+  viewer {
+    login
+    name
+    url
+    contributionsCollection {
+      contributionCalendar {
+        totalContributions
+        weeks { contributionDays { date contributionCount } }
+      }
+    }
+  }
+  reviewRequests: search(query: "is:open is:pr review-requested:@me archived:false", type: ISSUE, first: 50) { issueCount nodes { ...pr } }
+  assignedPrs: search(query: "is:open is:pr assignee:@me archived:false", type: ISSUE, first: 50) { issueCount nodes { ...pr } }
+  authoredPrs: search(query: "is:open is:pr author:@me archived:false", type: ISSUE, first: 50) { issueCount nodes { ...pr } }
+  assignedIssues: search(query: "is:open is:issue assignee:@me archived:false", type: ISSUE, first: 50) { issueCount nodes { ...issue } }
+  authoredIssues: search(query: "is:open is:issue author:@me archived:false", type: ISSUE, first: 50) { issueCount nodes { ...issue } }
+}
+fragment pr on PullRequest {
+  number title url updatedAt isDraft reviewDecision
+  author { login }
+  comments { totalCount }
+  repository { nameWithOwner }
+}
+fragment issue on Issue {
+  number title url updatedAt
+  author { login }
+  comments { totalCount }
+  repository { nameWithOwner }
+}
+GQL
+
+github_endpoint() {
+  case "$1" in
+    github.com|api.github.com) echo "https://api.github.com/graphql" ;;
+    *) echo "https://$1/api/graphql" ;;
+  esac
+}
+
+# Prefer the environment so a headless run works with no CLI at all, and
+# otherwise ask `gh`, which transparently handles keyring storage.
+github_token() {
+  local host=$1
+  if [[ $host == github.com ]]; then
+    [[ -n ${GH_TOKEN:-} ]] && { printf '%s\n' "$GH_TOKEN"; return 0; }
+    [[ -n ${GITHUB_TOKEN:-} ]] && { printf '%s\n' "$GITHUB_TOKEN"; return 0; }
+  fi
+  have gh || return 2
+  gh auth token --hostname "$host" 2>/dev/null
+}
+
+# Emit a provider that never got off the ground: no data, just the hint that
+# tells the user which command fixes it.
+unready_provider() {
+  local kind=$1 host=$2 is_default=$3 help=$4 err=$5 elapsed=$6
+  jqm -n --arg kind "$kind" --arg host "$host" --argjson isdefault "$is_default" \
+    --arg help "$help" --arg err "$err" --arg at "$(now_iso)" --argjson ms "$elapsed" \
+    'include "gitwork";
+     base_provider($kind; $host; $isdefault)
+     + {authHelpText: $help, error: $err, updatedAt: $at, elapsedMs: $ms}'
+}
+
+collect_github() {
+  local host=$1 is_default=$2 out=$3
+  local started token status help
+  started=$(now_ms)
+  ERR_FILE="$tmp/gh-$host.err"; : >"$ERR_FILE"
+
+  token=$(github_token "$host"); rc=$?
+  if ((rc != 0)); then
+    if ((rc == 2)); then
+      help="GitHub CLI not found. Install \`gh\`, then run: gh auth login"
+    else
+      help="Not signed in to $host. Run: gh auth login --hostname $host"
     fi
-  done
-  return 1
+    unready_provider github "$host" "$is_default" "$help" "" $(( $(now_ms) - started )) >"$out"
+    return
+  fi
+  if [[ -z $token ]]; then
+    unready_provider github "$host" "$is_default" \
+      "Not signed in to $host. Run: gh auth login --hostname $host" "" $(( $(now_ms) - started )) >"$out"
+    return
+  fi
+
+  AUTH_HEADER=(-H "Authorization: bearer $token")
+  jq -n --arg q "$GITHUB_QUERY" '{query: $q}' >"$tmp/gh-$host.payload"
+  status=$(http_graphql "$(github_endpoint "$host")" "$tmp/gh-$host.payload" "$tmp/gh-$host.json")
+
+  if [[ $status == 401 || $status == 403 ]]; then
+    unready_provider github "$host" "$is_default" \
+      "Token rejected by $host. Run: gh auth login --hostname $host" "" $(( $(now_ms) - started )) >"$out"
+    return
+  fi
+  if [[ $status != 2* ]] || ! jq -e . "$tmp/gh-$host.json" >/dev/null 2>&1; then
+    unready_provider github "$host" "$is_default" "Could not reach $host." \
+      "$(github_error "$status" "$tmp/gh-$host.json")" $(( $(now_ms) - started )) >"$out"
+    return
+  fi
+  # GraphQL reports its own errors with HTTP 200, so they never surface above.
+  if jq -e '(.errors // []) | length > 0' "$tmp/gh-$host.json" >/dev/null 2>&1; then
+    unready_provider github "$host" "$is_default" "Could not reach $host." \
+      "graphql: $(jq -r '[.errors[].message] | join("; ")' "$tmp/gh-$host.json")" \
+      $(( $(now_ms) - started )) >"$out"
+    return
+  fi
+
+  jqm --arg host "$host" --argjson isdefault "$is_default" --arg at "$(now_iso)" \
+    --argjson ms $(( $(now_ms) - started )) \
+    --argjson start "$CAL_START" --argjson days "$CAL_DAYS" \
+    'include "gitwork";
+     .data as $gh
+     | ($gh.viewer.login // "") as $viewer
+     | ($gh.viewer.contributionsCollection.contributionCalendar) as $cc
+     | base_provider("github"; $host; $isdefault)
+     + { ready: true,
+         updatedAt: $at,
+         elapsedMs: $ms,
+         username: $viewer,
+         displayName: ($gh.viewer.name // ""),
+         userUrl: ($gh.viewer.url // ""),
+         webUrl: (if ($gh.viewer.url // "") != ""
+                  then ($gh.viewer.url | rtrimstr("/" + $viewer))
+                  else ("https://" + $host) end),
+         calendar: build_calendar($start; $days; ($cc | counts_from_github_calendar);
+                                  ($cc.totalContributions // 0)),
+         reviewRequests: github_items($gh.reviewRequests.nodes; $viewer),
+         assignedPrs: github_items($gh.assignedPrs.nodes; $viewer),
+         authoredPrs: github_items($gh.authoredPrs.nodes; $viewer),
+         assignedIssues: github_items($gh.assignedIssues.nodes; $viewer),
+         authoredIssues: github_items($gh.authoredIssues.nodes; $viewer) }
+     | . + { totals: totals([
+         ["reviewRequests", ($gh.reviewRequests.issueCount // 0), (.reviewRequests | length)],
+         ["assignedPrs",    ($gh.assignedPrs.issueCount // 0),    (.assignedPrs | length)],
+         ["authoredPrs",    ($gh.authoredPrs.issueCount // 0),    (.authoredPrs | length)],
+         ["assignedIssues", ($gh.assignedIssues.issueCount // 0), (.assignedIssues | length)],
+         ["authoredIssues", ($gh.authoredIssues.issueCount // 0), (.authoredIssues | length)]]) }
+    ' "$tmp/gh-$host.json" >"$out" 2>>"$ERR_FILE"
+
+  [[ -s $out ]] || unready_provider github "$host" "$is_default" \
+    "Could not read the response from $host." "invalid API response" \
+    $(( $(now_ms) - started )) >"$out"
 }
 
-if needs_build; then
-  go_bin=$(find_go) || die "needs the Go toolchain to build the collector once. Install it (e.g. \`sudo pacman -S go\`) and reopen the panel."
-  mkdir -p "$plugin_dir/bin"
-  # Stdlib-only, no module downloads: this builds offline and takes ~1s.
-  # Built from inside the module so the surrounding plugin repo (which has no
-  # go.mod of its own) never gets mistaken for the main module.
-  (cd "$src_dir" && GOFLAGS= GOPROXY=off "$go_bin" build -trimpath -buildvcs=false \
-    -ldflags "-s -w" -o "$binary" .) >&2 || die "could not build the collector; see the error above."
+github_error() {
+  local status=$1 body=$2 detail
+  detail=$(jq -r '.message // empty' "$body" 2>/dev/null | head -c 200)
+  if [[ -n $detail ]]; then echo "HTTP $status: $detail"; else echo "HTTP $status"; fi
+}
+
+# ---------------------------------------------------------------------------
+# GitLab
+# ---------------------------------------------------------------------------
+
+# Identity plus all three merge-request queues in one request. Issues come over
+# REST because the root `issues` GraphQL field needs a username we do not have
+# yet, while REST's `scope=` filters work off the token alone.
+read -r -d '' GITLAB_QUERY <<'GQL'
+query {
+  currentUser {
+    username
+    name
+    webUrl
+    reviewRequestedMergeRequests(state: opened, first: 50, sort: UPDATED_DESC) { count nodes { ...mr } }
+    assignedMergeRequests(state: opened, first: 50, sort: UPDATED_DESC) { count nodes { ...mr } }
+    authoredMergeRequests(state: opened, first: 50, sort: UPDATED_DESC) { count nodes { ...mr } }
+  }
+}
+fragment mr on MergeRequest {
+  iid title webUrl updatedAt draft approved userNotesCount
+  author { username }
+  project { fullPath }
+}
+GQL
+
+gitlab_token() {
+  local host=$1
+  if [[ -n ${GITLAB_TOKEN:-} && $host == "${GITLAB_HOST:-}" ]]; then
+    printf '%s\n' "$GITLAB_TOKEN"; return 0
+  fi
+  have glab || return 2
+  glab config get token --host "$host" 2>/dev/null
+}
+
+gitlab_issues() {
+  local base=$1 scope=$2 out=$3 total_out=$4
+  local url status
+  url="$base/api/v4/issues?state=opened&scope=$scope&order_by=updated_at&sort=desc&per_page=50&with_labels_details=false"
+  status=$(http_get "$url" "$out" "$tmp/gl-$scope.head")
+  if [[ $status != 2* ]] || ! jq -e 'type == "array"' "$out" >/dev/null 2>&1; then
+    echo '[]' >"$out"; echo 0 >"$total_out"
+    printf 'issues %s: HTTP %s\n' "$scope" "${status:-000}" >"$out.err"
+    return 1
+  fi
+  rm -f "$out.err"
+  header_value "$tmp/gl-$scope.head" "X-Total" | grep -E '^[0-9]+$' >"$total_out" || echo 0 >"$total_out"
+}
+
+# GitLab has no contribution-calendar API, and /users/x/calendar.json is not
+# reliably available on self-managed instances, so the year is reconstructed
+# from the events feed. Page one reports the total page count, so every
+# remaining page is fetched at once rather than walked serially.
+gitlab_calendar() {
+  local base=$1 host=$2 out=$3
+  local after url status pages n prefix
+  after=$(date -u -d "@$((CAL_START - 86400))" +%Y-%m-%d)
+  prefix="$tmp/gl-$host-events"
+  url="$base/api/v4/events?after=$after&per_page=100&sort=asc&page=1"
+
+  status=$(http_get "$url" "$prefix-1.json" "$prefix-1.head")
+  if [[ $status != 2* ]] || ! jq -e 'type == "array"' "$prefix-1.json" >/dev/null 2>&1; then
+    jqm -n 'include "gitwork"; empty_calendar' >"$out"
+    return
+  fi
+
+  pages=$(header_value "$prefix-1.head" "X-Total-Pages")
+  [[ $pages =~ ^[0-9]+$ ]] || pages=1
+  ((pages > GITLAB_PAGE_CAP)) && pages=$GITLAB_PAGE_CAP
+
+  for ((n = 2; n <= pages; n++)); do
+    (
+      if ! s=$(http_get "$base/api/v4/events?after=$after&per_page=100&sort=asc&page=$n" \
+                 "$prefix-$n.json" "$prefix-$n.head") || [[ $s != 2* ]]; then
+        echo '[]' >"$prefix-$n.json"
+      fi
+      jq -e 'type == "array"' "$prefix-$n.json" >/dev/null 2>&1 || echo '[]' >"$prefix-$n.json"
+    ) &
+  done
+  wait
+
+  jqm -s --argjson start "$CAL_START" --argjson days "$CAL_DAYS" \
+    'include "gitwork";
+     build_calendar($start; $days; (add // [] | counts_from_gitlab_events); 0)' \
+    "$prefix"-*.json >"$out" 2>/dev/null || jqm -n 'include "gitwork"; empty_calendar' >"$out"
+}
+
+collect_gitlab() {
+  local host=$1 is_default=$2 out=$3
+  local started token status base help
+  started=$(now_ms)
+  ERR_FILE="$tmp/gl-$host.err"; : >"$ERR_FILE"
+
+  token=$(gitlab_token "$host"); rc=$?
+  if ((rc != 0)); then
+    if ((rc == 2)); then
+      help="GitLab CLI not found. Install \`glab\`, then run: glab auth login"
+    else
+      help="Not signed in to $host. Run: glab auth login --hostname $host"
+    fi
+    unready_provider gitlab "$host" "$is_default" "$help" "" $(( $(now_ms) - started )) >"$out"
+    return
+  fi
+  if [[ -z $token ]]; then
+    unready_provider gitlab "$host" "$is_default" \
+      "Not signed in to $host. Run: glab auth login --hostname $host" "" $(( $(now_ms) - started )) >"$out"
+    return
+  fi
+
+  base="https://$host"
+  AUTH_HEADER=(-H "PRIVATE-TOKEN: $token")
+  jq -n --arg q "$GITLAB_QUERY" '{query: $q}' >"$tmp/gl-$host.payload"
+
+  # The four calls are independent, so they fly together rather than in turn.
+  local graph_status_file="$tmp/gl-$host.status"
+  ( http_graphql "$base/api/graphql" "$tmp/gl-$host.payload" "$tmp/gl-$host.json" >"$graph_status_file" ) &
+  ( gitlab_issues "$base" assigned_to_me "$tmp/gl-$host.assigned.json" "$tmp/gl-$host.assigned.total" ) &
+  ( gitlab_issues "$base" created_by_me "$tmp/gl-$host.authored.json" "$tmp/gl-$host.authored.total" ) &
+  ( gitlab_calendar "$base" "$host" "$tmp/gl-$host.calendar.json" ) &
+  wait
+
+  status=$(cat "$graph_status_file" 2>/dev/null)
+  if [[ $status == 401 || $status == 403 ]]; then
+    unready_provider gitlab "$host" "$is_default" \
+      "Token rejected by $host. Run: glab auth login --hostname $host" "" $(( $(now_ms) - started )) >"$out"
+    return
+  fi
+  if [[ $status != 2* ]] || ! jq -e . "$tmp/gl-$host.json" >/dev/null 2>&1; then
+    unready_provider gitlab "$host" "$is_default" "Could not reach $host." \
+      "HTTP ${status:-000}" $(( $(now_ms) - started )) >"$out"
+    return
+  fi
+  if jq -e '(.errors // []) | length > 0' "$tmp/gl-$host.json" >/dev/null 2>&1; then
+    unready_provider gitlab "$host" "$is_default" "Could not reach $host." \
+      "graphql: $(jq -r '[.errors[].message] | join("; ")' "$tmp/gl-$host.json")" \
+      $(( $(now_ms) - started )) >"$out"
+    return
+  fi
+  if ! jq -e '(.data.currentUser.username // "") != ""' "$tmp/gl-$host.json" >/dev/null 2>&1; then
+    unready_provider gitlab "$host" "$is_default" \
+      "Token for $host has no user. Run: glab auth login --hostname $host" "" \
+      $(( $(now_ms) - started )) >"$out"
+    return
+  fi
+
+  # Issue failures are not fatal: MRs and the calendar still carry the panel,
+  # and the row simply reads zero. Only a total loss of both queues is worth
+  # naming, and even then the provider stays ready.
+  local issue_error=""
+  if [[ -f $tmp/gl-$host.assigned.json.err && -f $tmp/gl-$host.authored.json.err ]]; then
+    issue_error=$(head -1 "$tmp/gl-$host.assigned.json.err")
+  fi
+
+  jqm --arg host "$host" --arg issueError "$issue_error" --argjson isdefault "$is_default" --arg at "$(now_iso)" \
+    --argjson ms $(( $(now_ms) - started )) \
+    --slurpfile assigned "$tmp/gl-$host.assigned.json" \
+    --slurpfile authored "$tmp/gl-$host.authored.json" \
+    --slurpfile calendar "$tmp/gl-$host.calendar.json" \
+    --argjson assignedTotal "$(cat "$tmp/gl-$host.assigned.total" 2>/dev/null || echo 0)" \
+    --argjson authoredTotal "$(cat "$tmp/gl-$host.authored.total" 2>/dev/null || echo 0)" \
+    'include "gitwork";
+     .data.currentUser as $u
+     | ($u.username // "") as $viewer
+     | base_provider("gitlab"; $host; $isdefault)
+     + { ready: true,
+         updatedAt: $at,
+         elapsedMs: $ms,
+         error: $issueError,
+         username: $viewer,
+         displayName: ($u.name // ""),
+         userUrl: ($u.webUrl // ""),
+         calendar: $calendar[0],
+         reviewRequests: gitlab_mr_items($u.reviewRequestedMergeRequests.nodes; $viewer),
+         assignedPrs: gitlab_mr_items($u.assignedMergeRequests.nodes; $viewer),
+         authoredPrs: gitlab_mr_items($u.authoredMergeRequests.nodes; $viewer),
+         assignedIssues: gitlab_issue_items($assigned[0]; $viewer),
+         authoredIssues: gitlab_issue_items($authored[0]; $viewer) }
+     | . + { totals: totals([
+         ["reviewRequests", ($u.reviewRequestedMergeRequests.count // 0), (.reviewRequests | length)],
+         ["assignedPrs",    ($u.assignedMergeRequests.count // 0),        (.assignedPrs | length)],
+         ["authoredPrs",    ($u.authoredMergeRequests.count // 0),        (.authoredPrs | length)],
+         ["assignedIssues", $assignedTotal, (.assignedIssues | length)],
+         ["authoredIssues", $authoredTotal, (.authoredIssues | length)]]) }
+    ' "$tmp/gl-$host.json" >"$out" 2>>"$ERR_FILE"
+
+  [[ -s $out ]] || unready_provider gitlab "$host" "$is_default" \
+    "Could not read the response from $host." "invalid API response" \
+    $(( $(now_ms) - started )) >"$out"
+}
+
+# ---------------------------------------------------------------------------
+# Fan out
+# ---------------------------------------------------------------------------
+
+# The test suite sources this file to exercise the functions above directly.
+# Sourcing stops here so nothing is collected and no output is written.
+[[ -n ${GITWORK_TEST_LIB:-} ]] && return 0
+
+
+# A slow self-managed GitLab must not delay GitHub: the run costs the slowest
+# single host rather than the sum of all of them. Discovery order is display
+# order, so each result is numbered and reassembled by filename.
+run_started=$(now_ms)
+index=0
+
+while IFS= read -r host; do
+  [[ -n $host ]] || continue
+  is_default=false; ((index == 0)) && is_default=true
+  collect_github "$host" "$is_default" "$(printf '%s/p-%02d.json' "$tmp" "$index")" &
+  index=$((index + 1))
+done < <(github_hosts)
+
+gitlab_index=0
+while IFS= read -r host; do
+  [[ -n $host ]] || continue
+  is_default=false; ((gitlab_index == 0)) && is_default=true
+  collect_gitlab "$host" "$is_default" "$(printf '%s/p-%02d.json' "$tmp" "$index")" &
+  index=$((index + 1)); gitlab_index=$((gitlab_index + 1))
+done < <(gitlab_hosts)
+
+wait
+
+shopt -s nullglob
+provider_files=("$tmp"/p-*.json)
+shopt -u nullglob
+
+if ((${#provider_files[@]} == 0)); then
+  providers_json='[]'
+else
+  providers_json=$(jq -s '[.[] | select(type == "object")]' "${provider_files[@]}" 2>/dev/null || echo '[]')
 fi
 
-exec "$binary" "$@"
+# ---------------------------------------------------------------------------
+# Assemble and land atomically
+# ---------------------------------------------------------------------------
+
+previous='null'
+if [[ -n $output && -r $output ]]; then
+  previous=$(jq -c . "$output" 2>/dev/null || echo 'null')
+fi
+
+document=$(jqm -n \
+  --argjson providers "$providers_json" \
+  --argjson previous "$previous" \
+  --argjson schema "$SCHEMA_VERSION" \
+  --argjson cutoff "$(( $(date -u +%s) - STALE_WINDOW_SEC ))" \
+  --arg at "$(now_iso)" \
+  --argjson ms $(( $(now_ms) - run_started )) \
+  'include "gitwork";
+   { schemaVersion: $schema,
+     updatedAt: $at,
+     elapsedMs: $ms,
+     providers: ($providers | carry_forward($previous; $schema; $cutoff)) }')
+
+if [[ -z $document ]]; then
+  echo "gitwork: could not assemble the overview" >&2
+  exit 1
+fi
+
+if [[ $pretty == false ]]; then
+  document=$(printf '%s' "$document" | jq -c .)
+fi
+
+if [[ -z $output ]]; then
+  printf '%s\n' "$document"
+  exit 0
+fi
+
+# The panel watches this file, so a half-written overview would flash an empty
+# dashboard on every refresh.
+mkdir -p "$(dirname -- "$output")" || exit 1
+printf '%s\n' "$document" >"$output.tmp" && mv -f "$output.tmp" "$output"

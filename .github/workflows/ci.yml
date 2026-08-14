@@ -1,0 +1,17 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install jq and shellcheck
+        run: sudo apt-get update && sudo apt-get install -y jq shellcheck
+      - name: Shellcheck
+        run: shellcheck -S warning bin/gitwork tests/*.sh
+      - name: Tests
+        run: ./tests/run.sh
