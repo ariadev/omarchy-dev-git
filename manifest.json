@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "id": "dev.git",
+  "name": "Git",
+  "version": "1.0.0",
+  "author": "ariadev",
+  "license": "MIT",
+  "description": "GitHub and GitLab open work: activity streaks, review queue, and your open pull/merge requests in a native Omarchy bar panel.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Git",
+    "description": "One bar icon and one panel: per-provider activity streak, a grid of review/assignment counts, and click-to-open queues of merge requests and issues.",
+    "category": "Dev",
+    "aliases": ["git", "github", "gitlab", "merge-requests"],
+    "allowMultiple": false,
+    "defaults": {
+      "providers": {
+        "github": { "enabled": true },
+        "gitlab": { "enabled": true }
+      },
+      "refreshIntervalSec": 300
+    },
+    "schema": [
+      { "key": "refreshIntervalSec", "type": "integer", "label": "Refresh interval (seconds)", "min": 30, "max": 3600, "step": 30, "defaultValue": 300 }
+    ]
+  }
+}
