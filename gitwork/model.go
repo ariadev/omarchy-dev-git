@@ -1,10 +1,13 @@
 package main
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // SchemaVersion is bumped whenever the JSON contract below changes shape.
 // Main.qml refuses to render anything it does not recognize.
-const SchemaVersion = 2
+const SchemaVersion = 3
 
 const (
 	KindGitHub = "github"
@@ -20,6 +23,9 @@ type Item struct {
 	URL        string `json:"url"`
 	UpdatedAt  string `json:"updatedAt"`
 	Draft      bool   `json:"draft"`
+	// Author is the handle that opened it, empty when it is you. Rows only
+	// need it when somebody else's work is sitting in your queue.
+	Author string `json:"author"`
 	// Review is the aggregate review state of a PR/MR: "approved",
 	// "changes_requested", "review_required" or "" when unknown.
 	Review   string `json:"review"`
@@ -141,4 +147,13 @@ func (p *Provider) count(name string, reported int, rows []Item) {
 
 func nowISO() string {
 	return time.Now().UTC().Format(time.RFC3339)
+}
+
+// otherAuthor blanks the author when it is the viewer: a row in your own
+// queue does not need to tell you who opened it.
+func otherAuthor(author, viewer string) string {
+	if author == "" || strings.EqualFold(author, viewer) {
+		return ""
+	}
+	return author
 }

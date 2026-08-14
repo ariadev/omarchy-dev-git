@@ -47,11 +47,13 @@ query {
 }
 fragment pr on PullRequest {
   number title url updatedAt isDraft reviewDecision
+  author { login }
   comments { totalCount }
   repository { nameWithOwner }
 }
 fragment issue on Issue {
   number title url updatedAt
+  author { login }
   comments { totalCount }
   repository { nameWithOwner }
 }
@@ -64,7 +66,10 @@ type ghNode struct {
 	UpdatedAt      string `json:"updatedAt"`
 	IsDraft        bool   `json:"isDraft"`
 	ReviewDecision string `json:"reviewDecision"`
-	Comments       struct {
+	Author         *struct {
+		Login string `json:"login"`
+	} `json:"author"`
+	Comments struct {
 		TotalCount int `json:"totalCount"`
 	} `json:"comments"`
 	Repository struct {
@@ -160,11 +165,11 @@ func collectGitHub(ctx context.Context, host string, isDefault bool) *Provider {
 		p.WebURL = strings.TrimSuffix(p.UserURL, "/"+p.Username)
 	}
 
-	p.ReviewRequests = ghItems(data.ReviewRequests.Nodes)
-	p.AssignedPrs = ghItems(data.AssignedPrs.Nodes)
-	p.AuthoredPrs = ghItems(data.AuthoredPrs.Nodes)
-	p.AssignedIssues = ghItems(data.AssignedIssues.Nodes)
-	p.AuthoredIssues = ghItems(data.AuthoredIssues.Nodes)
+	p.ReviewRequests = ghItems(data.ReviewRequests.Nodes, p.Username)
+	p.AssignedPrs = ghItems(data.AssignedPrs.Nodes, p.Username)
+	p.AuthoredPrs = ghItems(data.AuthoredPrs.Nodes, p.Username)
+	p.AssignedIssues = ghItems(data.AssignedIssues.Nodes, p.Username)
+	p.AuthoredIssues = ghItems(data.AuthoredIssues.Nodes, p.Username)
 
 	p.count("reviewRequests", data.ReviewRequests.IssueCount, p.ReviewRequests)
 	p.count("assignedPrs", data.AssignedPrs.IssueCount, p.AssignedPrs)
@@ -185,7 +190,7 @@ func collectGitHub(ctx context.Context, host string, isDefault bool) *Provider {
 	return p
 }
 
-func ghItems(nodes []ghNode) []Item {
+func ghItems(nodes []ghNode, viewer string) []Item {
 	items := make([]Item, 0, len(nodes))
 	for _, n := range nodes {
 		if n.URL == "" {
@@ -198,9 +203,17 @@ func ghItems(nodes []ghNode) []Item {
 			URL:        n.URL,
 			UpdatedAt:  n.UpdatedAt,
 			Draft:      n.IsDraft,
+			Author:     otherAuthor(authorLogin(n), viewer),
 			Review:     strings.ToLower(n.ReviewDecision),
 			Comments:   n.Comments.TotalCount,
 		})
 	}
 	return items
+}
+
+func authorLogin(n ghNode) string {
+	if n.Author == nil {
+		return ""
+	}
+	return n.Author.Login
 }

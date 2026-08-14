@@ -97,6 +97,12 @@ Panel {
     root.selectHost(g.hosts[next].key)
   }
 
+  function jumpHost(index) {
+    var g = root.group
+    if (!g || index < 0 || index >= g.hosts.length) return
+    root.selectHost(g.hosts[index].key)
+  }
+
   // ---------------------------------------------------------------- cursor
 
   property bool cursorActive: false
@@ -151,6 +157,66 @@ Panel {
     return out
   }
 
+  // Vertical focus zones, top to bottom: the provider tabs, the host switch,
+  // then the work rows. Up/Down (or j/k) walks between them and Left/Right
+  // (or h/l) moves inside whichever zone holds the cursor, so the panel reads
+  // the same way it looks.
+  property string focusZone: "provider"
+
+  readonly property bool hostZoneAvailable: !!root.group && root.group.hosts.length > 1
+
+  function zoneOrder() {
+    var zones = ["provider"]
+    if (root.hostZoneAvailable) zones.push("host")
+    if (root.focusRows.length > 0) zones.push("rows")
+    return zones
+  }
+
+  function enterZone(zone) {
+    root.focusZone = zone
+    root.cursorActive = zone === "rows"
+    if (zone === "rows") root.scrollToSelected()
+    else if (panelFlick && zone === "provider") panelFlick.contentY = 0
+  }
+
+  function moveZone(dy) {
+    var zones = root.zoneOrder()
+    var at = zones.indexOf(root.focusZone)
+    if (at < 0) at = 0
+
+    if (root.focusZone === "rows" && zones[at] === "rows") {
+      // Inside the rows the cursor scrolls first and only leaves the zone
+      // when it is already parked on the top row.
+      if (dy > 0 || (root.cursorActive && root.selectedRowIndex > 0)) {
+        root.moveRows(dy)
+        return
+      }
+    }
+
+    var next = root.clamp(at + dy, 0, zones.length - 1)
+    if (zones[next] === root.focusZone) {
+      if (root.focusZone === "rows") root.moveRows(dy)
+      return
+    }
+    root.enterZone(zones[next])
+  }
+
+  function moveWithinZone(dx) {
+    if (root.focusZone === "host") root.stepHost(dx)
+    else root.stepGroup(dx)
+  }
+
+  function activateZone() {
+    if (root.focusZone === "rows") root.activateRow()
+    // In the tab and host zones the selection *is* the action; Enter opens the
+    // host's own page, which is the only thing left to do there.
+    else if (root.provider) root.openUrl(root.provider.userUrl || root.provider.webUrl)
+  }
+
+  // A refresh or a host switch can dissolve the zone the cursor sits in.
+  onFocusZoneChanged: root.cursorActive = root.focusZone === "rows"
+  onHostZoneAvailableChanged: if (!root.hostZoneAvailable && root.focusZone === "host") root.enterZone("provider")
+
   function moveRows(dy) {
     var n = root.focusRows.length
     if (n === 0) { root.cursorActive = false; return }
@@ -165,6 +231,7 @@ Panel {
   function jumpRows(index) {
     var n = root.focusRows.length
     if (n === 0) return
+    root.focusZone = "rows"
     root.cursorActive = true
     root.selectedRowIndex = root.clamp(index, 0, n - 1)
     root.scrollToSelected()
@@ -316,6 +383,7 @@ Panel {
   }
 
   onOpenedChanged: if (opened) {
+    focusZone = "provider"
     cursorActive = false
     selectedRowIndex = 0
     nowMs = Date.now()
@@ -399,16 +467,19 @@ Panel {
       anchors.fill: parent
 
       onMoveRequested: function(dx, dy) {
-        if (dx !== 0) root.stepGroup(dx)
-        if (dy !== 0) root.moveRows(dy)
+        if (dx !== 0) root.moveWithinZone(dx)
+        if (dy !== 0) root.moveZone(dy)
       }
-      onActivateRequested: root.activateRow()
+      onActivateRequested: root.activateZone()
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "r" || t === "R") root.refreshNow()
-        else if (t === "[") root.stepHost(-1)
-        else if (t === "]") root.stepHost(1)
+        else if (t === "[" || t === "H") root.stepHost(-1)
+        else if (t === "]" || t === "L") root.stepHost(1)
+        // 1-9 jumps straight to a host, which beats stepping through a long
+        // list of self-managed instances one at a time.
+        else if (t >= "1" && t <= "9") root.jumpHost(t.charCodeAt(0) - 49)
         else if (t === "g") root.jumpRows(0)
         else if (t === "G") root.jumpRows(root.focusRows.length - 1)
       }
@@ -453,10 +524,8 @@ Panel {
                 // Just the provider name: which host is in play is the host
                 // switch's job, not the tab's.
                 text: modelData.name
-                tooltipText: modelData.hosts.length > 1
-                  ? modelData.hosts.length + " hosts configured"
-                  : modelData.hosts[0].hostLabel
                 selected: index === root.groupIndex
+                hasCursor: root.focusZone === "provider" && index === root.groupIndex
                 bordered: true
                 foreground: root.foreground
                 fontFamily: root.fontFamily
@@ -591,11 +660,27 @@ Panel {
             width: parent.width
             spacing: Style.space(6)
 
-            PanelSectionHeader {
+            Item {
               width: parent.width
-              text: "HOST"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
+              implicitHeight: hostHeader.implicitHeight
+
+              PanelSectionHeader {
+                id: hostHeader
+                anchors.left: parent.left
+                text: "HOST"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              // The switch is keyboard-first; say so, or nobody finds it.
+              Text {
+                anchors.right: parent.right
+                anchors.baseline: hostHeader.baseline
+                text: "← →"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
             }
 
             // A Flow, not a Row: self-managed hostnames are long and wrapping
@@ -611,13 +696,16 @@ Panel {
                   required property var modelData
                   required property int index
 
+                  // Just the hostname. A tick and an index ahead of it cost
+                  // more width than they carry: signed-in state already reads
+                  // from the dimmed foreground, and the row is navigated with
+                  // the arrows, not by number.
                   text: modelData.hostLabel
-                  iconText: modelData.ready ? root.glyphApproved : ""
-                  iconSize: Style.font.caption
-                  tooltipText: modelData.ready
-                    ? "Signed in as @" + modelData.username
-                    : modelData.authHelpText
+                  // Only the hosts that need something from you get a
+                  // tooltip; a signed-in host has nothing to explain.
+                  tooltipText: modelData.ready ? "" : modelData.authHelpText
                   selected: index === root.hostIndex
+                  hasCursor: root.focusZone === "host" && index === root.hostIndex
                   bordered: true
                   foreground: modelData.ready ? root.foreground : root.dim
                   fontFamily: root.fontFamily
@@ -730,6 +818,7 @@ Panel {
               id: yearGraph
               width: parent.width
               calendar: root.provider ? root.provider.calendar : null
+              signature: root.provider ? root.provider.key : ""
             }
 
             // Streak on the left, intensity key on the right — the graph's
@@ -833,7 +922,6 @@ Panel {
                 value: root.provider ? Number(root.provider.totals.reviewRequests || 0) : 0
                 label: "AWAITING REVIEW"
                 glyph: root.glyphRequest
-                tooltipText: root.provider ? ("Open " + root.provider.mrTermShort + " that need your review") : ""
                 urgent: value > 0
                 onActivated: root.openUrl(root.categoryUrl("review"))
               }
@@ -843,7 +931,6 @@ Panel {
                 value: root.provider ? Number(root.provider.totals.assignedPrs || 0) : 0
                 label: root.provider ? "ASSIGNED " + root.provider.mrTermShort.toUpperCase() : ""
                 glyph: root.glyphRequest
-                tooltipText: root.provider ? ("Open " + root.provider.mrTermShort + " assigned to you") : ""
                 onActivated: root.openUrl(root.categoryUrl("assigned"))
               }
 
@@ -852,7 +939,6 @@ Panel {
                 value: root.provider ? Number(root.provider.totals.assignedIssues || 0) : 0
                 label: "ASSIGNED ISSUES"
                 glyph: root.glyphIssue
-                tooltipText: "Open issues assigned to you"
                 onActivated: root.openUrl(root.categoryUrl("assignedIssues"))
               }
 
@@ -861,7 +947,6 @@ Panel {
                 value: root.provider ? Number(root.provider.totals.authoredIssues || 0) : 0
                 label: "AUTHORED ISSUES"
                 glyph: root.glyphIssue
-                tooltipText: "Open issues you opened"
                 onActivated: root.openUrl(root.categoryUrl("authoredIssues"))
               }
             }
@@ -952,6 +1037,10 @@ Panel {
     id: graph
 
     property var calendar: null
+    // Identity of the record being drawn. Two hosts produce grids of the same
+    // shape, so the canvas needs something that actually differs between them
+    // to know a host switch changed the data.
+    property string signature: ""
 
     readonly property var counts: calendar ? calendar.counts : []
     readonly property var levels: calendar ? calendar.levels : []
@@ -1049,7 +1138,11 @@ Panel {
       // One key for every input the painting depends on, so a theme change or
       // a data refresh repaints and nothing else does.
       readonly property string paintKey: [
-        graph.counts.length, graph.levels.length, graph.pitch, graph.cell,
+        graph.signature, graph.counts.length, graph.levels.length,
+        graph.calendar ? graph.calendar.end : "",
+        graph.calendar ? graph.calendar.total : 0,
+        graph.calendar ? graph.calendar.max : 0,
+        graph.pitch, graph.cell,
         String(root.accent), String(root.foreground)
       ].join(":")
 
@@ -1117,7 +1210,6 @@ Panel {
     property int value: 0
     property string label: ""
     property string glyph: ""
-    property string tooltipText: ""
     property bool urgent: false
     signal activated()
 
@@ -1178,12 +1270,6 @@ Panel {
       cursorShape: Qt.PointingHandCursor
       onClicked: statBox.activated()
     }
-
-    PanelToolTip {
-      visible: boxHover.containsMouse && statBox.tooltipText !== ""
-      text: statBox.tooltipText
-      fontFamily: root.fontFamily
-    }
   }
 
   // One queue row: state glyph, title, and a meta line that says where it
@@ -1203,6 +1289,9 @@ Panel {
     readonly property bool approved: item ? item.review === "approved" : false
     readonly property bool changesRequested: item ? item.review === "changes_requested" : false
     readonly property int comments: item ? item.comments : 0
+    // The collector only fills this in when somebody else opened the row, so
+    // your own queues stay uncluttered.
+    readonly property string author: item && item.author ? item.author : ""
 
     readonly property color glyphColor: {
       if (workRow.draft) return root.alpha(root.foreground, 0.35)
@@ -1290,6 +1379,7 @@ Panel {
               - (rowComments.visible ? rowComments.width + metaRow.spacing : 0))
           text: workRow.repository
             + (workRow.item && workRow.item.number > 0 ? "  #" + workRow.item.number : "")
+            + (workRow.author !== "" ? "  ·  @" + workRow.author : "")
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -1325,6 +1415,7 @@ Panel {
       cursorShape: Qt.PointingHandCursor
       onClicked: root.openUrl(workRow.url)
       onEntered: {
+        root.focusZone = "rows"
         root.cursorActive = true
         root.selectedRowIndex = workRow.flatIndex
       }

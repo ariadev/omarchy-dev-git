@@ -30,6 +30,7 @@ query {
 }
 fragment mr on MergeRequest {
   iid title webUrl updatedAt draft approved userNotesCount
+  author { username }
   project { fullPath }
 }
 `
@@ -42,7 +43,10 @@ type glMR struct {
 	Draft          bool   `json:"draft"`
 	Approved       bool   `json:"approved"`
 	UserNotesCount int    `json:"userNotesCount"`
-	Project        struct {
+	Author         *struct {
+		Username string `json:"username"`
+	} `json:"author"`
+	Project struct {
 		FullPath string `json:"fullPath"`
 	} `json:"project"`
 }
@@ -70,7 +74,10 @@ type glIssue struct {
 	WebURL         string `json:"web_url"`
 	UpdatedAt      string `json:"updated_at"`
 	UserNotesCount int    `json:"user_notes_count"`
-	References     struct {
+	Author         *struct {
+		Username string `json:"username"`
+	} `json:"author"`
+	References struct {
 		Full string `json:"full"`
 	} `json:"references"`
 }
@@ -159,11 +166,11 @@ func collectGitLab(ctx context.Context, host string, isDefault bool) *Provider {
 	p.UserURL = user.WebURL
 	p.Calendar = calendar
 
-	p.ReviewRequests = glMRItems(user.ReviewRequestedMergeRequests.Nodes)
-	p.AssignedPrs = glMRItems(user.AssignedMergeRequests.Nodes)
-	p.AuthoredPrs = glMRItems(user.AuthoredMergeRequests.Nodes)
-	p.AssignedIssues = glIssueItems(assigned)
-	p.AuthoredIssues = glIssueItems(authored)
+	p.ReviewRequests = glMRItems(user.ReviewRequestedMergeRequests.Nodes, p.Username)
+	p.AssignedPrs = glMRItems(user.AssignedMergeRequests.Nodes, p.Username)
+	p.AuthoredPrs = glMRItems(user.AuthoredMergeRequests.Nodes, p.Username)
+	p.AssignedIssues = glIssueItems(assigned, p.Username)
+	p.AuthoredIssues = glIssueItems(authored, p.Username)
 
 	p.count("reviewRequests", user.ReviewRequestedMergeRequests.Count, p.ReviewRequests)
 	p.count("assignedPrs", user.AssignedMergeRequests.Count, p.AssignedPrs)
@@ -260,7 +267,7 @@ func gitlabCalendar(ctx context.Context, base string, headers map[string]string)
 	return buildCalendar(counts, today, 0)
 }
 
-func glMRItems(nodes []glMR) []Item {
+func glMRItems(nodes []glMR, viewer string) []Item {
 	items := make([]Item, 0, len(nodes))
 	for _, n := range nodes {
 		if n.WebURL == "" {
@@ -278,6 +285,7 @@ func glMRItems(nodes []glMR) []Item {
 			URL:        n.WebURL,
 			UpdatedAt:  n.UpdatedAt,
 			Draft:      n.Draft,
+			Author:     otherAuthor(glUsername(n.Author), viewer),
 			Review:     review,
 			Comments:   n.UserNotesCount,
 		})
@@ -285,7 +293,7 @@ func glMRItems(nodes []glMR) []Item {
 	return items
 }
 
-func glIssueItems(rows []glIssue) []Item {
+func glIssueItems(rows []glIssue, viewer string) []Item {
 	items := make([]Item, 0, len(rows))
 	for _, r := range rows {
 		if r.WebURL == "" {
@@ -297,6 +305,7 @@ func glIssueItems(rows []glIssue) []Item {
 			Repository: projectFromReference(r.References.Full),
 			URL:        r.WebURL,
 			UpdatedAt:  r.UpdatedAt,
+			Author:     otherAuthor(glUsername(r.Author), viewer),
 			Comments:   r.UserNotesCount,
 		})
 	}
@@ -309,4 +318,13 @@ func projectFromReference(ref string) string {
 		return ref[:i]
 	}
 	return ref
+}
+
+func glUsername(author *struct {
+	Username string `json:"username"`
+}) string {
+	if author == nil {
+		return ""
+	}
+	return author.Username
 }

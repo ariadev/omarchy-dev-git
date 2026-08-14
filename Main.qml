@@ -13,7 +13,7 @@ Item {
 
   property var settings: ({})
 
-  readonly property int schemaVersion: 2
+  readonly property int schemaVersion: 3
 
   readonly property string home: Quickshell.env("HOME") || ""
   readonly property string stateHome: Quickshell.env("XDG_STATE_HOME") || home + "/.local/state"
@@ -157,6 +157,7 @@ Item {
         url: String(raw.url || ""),
         updatedAt: String(raw.updatedAt || ""),
         draft: raw.draft === true,
+        author: String(raw.author || ""),
         review: String(raw.review || ""),
         comments: Number(raw.comments || 0)
       })
