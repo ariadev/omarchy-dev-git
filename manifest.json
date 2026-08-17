@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "dev.git",
   "name": "Git",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "author": "ariadev",
   "license": "MIT",
-  "description": "GitHub and GitLab open work: a full-year contribution graph, review queue, and your open pull/merge requests in a native Omarchy bar panel.",
+  "description": "GitHub, GitLab and Gitea open work: a full-year contribution graph, review queue, and your open pull/merge requests in a native Omarchy bar panel.",
   "kinds": [
     "bar-widget"
   ],
@@ -15,12 +15,13 @@
   },
   "barWidget": {
     "displayName": "Git",
-    "description": "One bar icon and one panel: per-provider full-year activity graph, a grid of review/assignment counts, and click-to-open queues of merge requests and issues. Multiple hosts per provider (GitHub Enterprise, self-managed GitLab) switch inside the tab.",
+    "description": "One bar icon and one panel: per-provider full-year activity graph, a grid of review/assignment counts, and click-to-open queues of merge requests and issues. Multiple hosts per provider (GitHub Enterprise, self-managed GitLab and Gitea) switch inside the tab.",
     "category": "Dev",
     "aliases": [
       "git",
       "github",
       "gitlab",
+      "gitea",
       "merge-requests",
       "pull-requests"
     ],
@@ -31,6 +32,9 @@
           "enabled": true
         },
         "gitlab": {
+          "enabled": true
+        },
+        "gitea": {
           "enabled": true
         }
       },

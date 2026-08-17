@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Collect GitHub and GitLab open work into one JSON overview for the dev.git
+# Collect GitHub, GitLab and Gitea open work into one JSON overview for the dev.git
 # Omarchy bar plugin.
 #
 # Nothing here is built or installed: the plugin is dropped in and runs. The
-# only requirements are curl and jq, plus whichever of `gh`/`glab` already
+# only requirements are curl and jq, plus whichever of `gh`/`glab`/`tea` already
 # holds your credentials — the same CLIs the panel already assumed.
 #
 # Every host is collected concurrently in its own subshell and lands in its own
@@ -134,6 +134,47 @@ gitlab_hosts() {
   [[ -n $raw ]] || return 0
   mapfile -t hosts <<<"$raw"
   order_default_first gitlab.com "${hosts[@]}"
+}
+
+# tea keeps its accounts in one YAML list, each entry carrying its own url and
+# token, so a single pass yields everything the Gitea collector needs. Emitted
+# as url<TAB>token<TAB>default so callers can pick either field.
+tea_logins() {
+  local path
+  path="$(config_home)/tea/config.yml"
+  [[ -r $path ]] || return 0
+  awk '
+    function flush() {
+      if (url != "") printf "%s\t%s\t%s\n", url, token, def
+      url = ""; token = ""; def = "false"
+    }
+    BEGIN { def = "false" }
+    /\t/ { next }
+    { sub(/\r$/, ""); line = $0; trimmed = line
+      sub(/^[ ]+/, "", trimmed); sub(/[ ]+$/, "", trimmed) }
+    trimmed == "" || trimmed ~ /^#/ { next }
+    line ~ /^[A-Za-z]/ { section = trimmed; sub(/:.*$/, "", section); next }
+    section != "logins" { next }
+    trimmed ~ /^- / { flush(); sub(/^-[ ]+/, "", trimmed) }
+    {
+      key = trimmed; sub(/:.*$/, "", key)
+      val = trimmed; sub(/^[^:]*:[ ]*/, "", val); gsub(/^["\047]|["\047]$/, "", val)
+      if (key == "url") url = val
+      else if (key == "token") token = val
+      else if (key == "default") def = val
+    }
+    END { flush() }
+  ' "$path"
+}
+
+gitea_hosts() {
+  local raw primary
+  if [[ -n ${GITEA_HOST:-} ]]; then printf '%s\n' "$GITEA_HOST" | dedupe; return; fi
+  raw=$(tea_logins | cut -f1 | dedupe)
+  [[ -n $raw ]] || return 0
+  primary=$(tea_logins | awk -F'\t' '$3 == "true" {print $1; exit}' | dedupe)
+  mapfile -t hosts <<<"$raw"
+  order_default_first "$primary" "${hosts[@]}"
 }
 
 # ---------------------------------------------------------------------------
@@ -391,14 +432,14 @@ gitlab_issues() {
   local base=$1 scope=$2 out=$3 total_out=$4
   local url status
   url="$base/api/v4/issues?state=opened&scope=$scope&order_by=updated_at&sort=desc&per_page=50&with_labels_details=false"
-  status=$(http_get "$url" "$out" "$tmp/gl-$scope.head")
+  status=$(http_get "$url" "$out" "$out.head")
   if [[ $status != 2* ]] || ! jq -e 'type == "array"' "$out" >/dev/null 2>&1; then
     echo '[]' >"$out"; echo 0 >"$total_out"
     printf 'issues %s: HTTP %s\n' "$scope" "${status:-000}" >"$out.err"
     return 1
   fi
   rm -f "$out.err"
-  header_value "$tmp/gl-$scope.head" "X-Total" | grep -E '^[0-9]+$' >"$total_out" || echo 0 >"$total_out"
+  header_value "$out.head" "X-Total" | grep -E '^[0-9]+$' >"$total_out" || echo 0 >"$total_out"
 }
 
 # GitLab has no contribution-calendar API, and /users/x/calendar.json is not
@@ -543,6 +584,153 @@ collect_gitlab() {
 }
 
 # ---------------------------------------------------------------------------
+# Gitea
+# ---------------------------------------------------------------------------
+
+# Gitea has neither a GraphQL API nor a dashboard endpoint, but its issue
+# search takes the whole queue definition in query parameters and answers both
+# issues and pulls from one row shape, so all five queues are the same call
+# with different flags — and they all fly at once.
+GITEA_QUEUES=(
+  "reviewRequests:type=pulls&review_requested=true"
+  "assignedPrs:type=pulls&assigned=true"
+  "authoredPrs:type=pulls&created=true"
+  "assignedIssues:type=issues&assigned=true"
+  "authoredIssues:type=issues&created=true"
+)
+
+gitea_token() {
+  local host=$1 url token
+  if [[ -n ${GITEA_TOKEN:-} ]]; then
+    if [[ -z ${GITEA_HOST:-} || $host == "$(printf '%s\n' "$GITEA_HOST" | dedupe)" ]]; then
+      printf '%s\n' "$GITEA_TOKEN"; return 0
+    fi
+  fi
+  [[ -r "$(config_home)/tea/config.yml" ]] || { have tea || return 2; return 1; }
+  while IFS=$'\t' read -r url token _; do
+    [[ "$(printf '%s\n' "$url" | dedupe)" == "$host" ]] || continue
+    printf '%s\n' "$token"
+    return 0
+  done < <(tea_logins)
+  return 1
+}
+
+# One queue. Failures are recorded but not fatal: the other four still fill the
+# panel, and the empty row reads zero rather than blanking the host.
+gitea_search() {
+  local base=$1 tag=$2 params=$3 out=$4 total_out=$5
+  local url status
+  url="$base/api/v1/repos/issues/search?state=open&limit=50&sort=recentupdate&$params"
+  status=$(http_get "$url" "$out" "$out.head")
+  if [[ $status != 2* ]] || ! jq -e 'type == "array"' "$out" >/dev/null 2>&1; then
+    echo '[]' >"$out"; echo 0 >"$total_out"
+    printf '%s: HTTP %s\n' "$tag" "${status:-000}" >"$out.err"
+    return 1
+  fi
+  rm -f "$out.err"
+  header_value "$out.head" "X-Total-Count" | grep -E '^[0-9]+$' >"$total_out" || echo 0 >"$total_out"
+}
+
+collect_gitea() {
+  local host=$1 is_default=$2 out=$3
+  local started token status base help prefix entry name params rc
+  started=$(now_ms)
+  prefix="$tmp/gt-$host"
+  ERR_FILE="$prefix.err"; : >"$ERR_FILE"
+
+  token=$(gitea_token "$host"); rc=$?
+  if ((rc != 0)) || [[ -z $token ]]; then
+    if ((rc == 2)); then
+      help="Gitea CLI not found. Install \`tea\`, then run: tea login add --url https://$host"
+    else
+      help="Not signed in to $host. Run: tea login add --url https://$host"
+    fi
+    unready_provider gitea "$host" "$is_default" "$help" "" $(( $(now_ms) - started )) >"$out"
+    return
+  fi
+
+  base="https://$host"
+  AUTH_HEADER=(-H "Authorization: token $token")
+
+  status=$(http_get "$base/api/v1/user" "$prefix.user.json" "$prefix.user.head")
+  if [[ $status == 401 || $status == 403 ]]; then
+    unready_provider gitea "$host" "$is_default" \
+      "Token rejected by $host. Run: tea login add --url $base" "" $(( $(now_ms) - started )) >"$out"
+    return
+  fi
+  if [[ $status != 2* ]] || ! jq -e '(.login // "") != ""' "$prefix.user.json" >/dev/null 2>&1; then
+    unready_provider gitea "$host" "$is_default" "Could not reach $host." \
+      "HTTP ${status:-000}" $(( $(now_ms) - started )) >"$out"
+    return
+  fi
+  local viewer
+  viewer=$(jq -r '.login' "$prefix.user.json")
+
+  # Six independent requests, so they go together rather than in turn.
+  ( http_get "$base/api/v1/users/$(printf '%s' "$viewer" | jq -sRr @uri)/heatmap" \
+      "$prefix.heatmap.json" "$prefix.heatmap.head" >/dev/null
+    jq -e 'type == "array"' "$prefix.heatmap.json" >/dev/null 2>&1 || echo '[]' >"$prefix.heatmap.json" ) &
+  for entry in "${GITEA_QUEUES[@]}"; do
+    name=${entry%%:*}; params=${entry#*:}
+    ( gitea_search "$base" "$name" "$params" "$prefix.$name.json" "$prefix.$name.total" ) &
+  done
+  wait
+
+  # Only a total loss of every queue is worth naming; the host stays ready
+  # either way, because the calendar and identity are still real.
+  local queue_error="" failures=0
+  for entry in "${GITEA_QUEUES[@]}"; do
+    name=${entry%%:*}
+    [[ -f $prefix.$name.json.err ]] && failures=$((failures + 1))
+  done
+  ((failures == ${#GITEA_QUEUES[@]})) && queue_error=$(head -1 "$prefix.reviewRequests.json.err")
+
+  jqm -n --arg host "$host" --arg viewer "$viewer" --arg queueError "$queue_error" \
+    --argjson isdefault "$is_default" --arg at "$(now_iso)" \
+    --argjson ms $(( $(now_ms) - started )) \
+    --argjson start "$CAL_START" --argjson days "$CAL_DAYS" \
+    --slurpfile user "$prefix.user.json" \
+    --slurpfile heatmap "$prefix.heatmap.json" \
+    --slurpfile reviewRequests "$prefix.reviewRequests.json" \
+    --slurpfile assignedPrs "$prefix.assignedPrs.json" \
+    --slurpfile authoredPrs "$prefix.authoredPrs.json" \
+    --slurpfile assignedIssues "$prefix.assignedIssues.json" \
+    --slurpfile authoredIssues "$prefix.authoredIssues.json" \
+    --argjson reviewRequestsTotal "$(cat "$prefix.reviewRequests.total" 2>/dev/null || echo 0)" \
+    --argjson assignedPrsTotal "$(cat "$prefix.assignedPrs.total" 2>/dev/null || echo 0)" \
+    --argjson authoredPrsTotal "$(cat "$prefix.authoredPrs.total" 2>/dev/null || echo 0)" \
+    --argjson assignedIssuesTotal "$(cat "$prefix.assignedIssues.total" 2>/dev/null || echo 0)" \
+    --argjson authoredIssuesTotal "$(cat "$prefix.authoredIssues.total" 2>/dev/null || echo 0)" \
+    'include "gitwork";
+     $user[0] as $u
+     | base_provider("gitea"; $host; $isdefault)
+     + { ready: true,
+         updatedAt: $at,
+         elapsedMs: $ms,
+         error: $queueError,
+         username: $viewer,
+         displayName: ($u.full_name // ""),
+         userUrl: ("https://" + $host + "/" + $viewer),
+         calendar: build_calendar($start; $days; ($heatmap[0] | counts_from_gitea_heatmap); 0),
+         reviewRequests: gitea_items($reviewRequests[0]; $viewer),
+         assignedPrs: gitea_items($assignedPrs[0]; $viewer),
+         authoredPrs: gitea_items($authoredPrs[0]; $viewer),
+         assignedIssues: gitea_items($assignedIssues[0]; $viewer),
+         authoredIssues: gitea_items($authoredIssues[0]; $viewer) }
+     | . + { totals: totals([
+         ["reviewRequests", $reviewRequestsTotal, (.reviewRequests | length)],
+         ["assignedPrs",    $assignedPrsTotal,    (.assignedPrs | length)],
+         ["authoredPrs",    $authoredPrsTotal,    (.authoredPrs | length)],
+         ["assignedIssues", $assignedIssuesTotal, (.assignedIssues | length)],
+         ["authoredIssues", $authoredIssuesTotal, (.authoredIssues | length)]]) }
+    ' >"$out" 2>>"$ERR_FILE"
+
+  [[ -s $out ]] || unready_provider gitea "$host" "$is_default" \
+    "Could not read the response from $host." "invalid API response" \
+    $(( $(now_ms) - started )) >"$out"
+}
+
+# ---------------------------------------------------------------------------
 # Fan out
 # ---------------------------------------------------------------------------
 
@@ -571,6 +759,14 @@ while IFS= read -r host; do
   collect_gitlab "$host" "$is_default" "$(printf '%s/p-%02d.json' "$tmp" "$index")" &
   index=$((index + 1)); gitlab_index=$((gitlab_index + 1))
 done < <(gitlab_hosts)
+
+gitea_index=0
+while IFS= read -r host; do
+  [[ -n $host ]] || continue
+  is_default=false; ((gitea_index == 0)) && is_default=true
+  collect_gitea "$host" "$is_default" "$(printf '%s/p-%02d.json' "$tmp" "$index")" &
+  index=$((index + 1)); gitea_index=$((gitea_index + 1))
+done < <(gitea_hosts)
 
 wait
 

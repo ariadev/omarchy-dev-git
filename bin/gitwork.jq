@@ -102,7 +102,9 @@ def other_author($author; $viewer):
 def base_provider($kind; $host; $is_default):
   { key: ($kind + "@" + $host),
     kind: $kind,
-    name: (if $kind == "github" then "GitHub" else "GitLab" end),
+    name: (if $kind == "github" then "GitHub"
+           elif $kind == "gitea" then "Gitea"
+           else "GitLab" end),
     host: $host,
     hostLabel: $host,
     defaultHost: $is_default,
@@ -117,8 +119,8 @@ def base_provider($kind; $host; $is_default):
     error: "",
     updatedAt: "",
     elapsedMs: 0,
-    mrTerm: (if $kind == "github" then "Pull requests" else "Merge requests" end),
-    mrTermShort: (if $kind == "github" then "PRs" else "MRs" end),
+    mrTerm: (if $kind == "gitlab" then "Merge requests" else "Pull requests" end),
+    mrTermShort: (if $kind == "gitlab" then "MRs" else "PRs" end),
     calendar: empty_calendar,
     reviewRequests: [],
     assignedPrs: [],
@@ -167,9 +169,31 @@ def gitlab_issue_items($rows; $viewer):
       review: "",
       comments: (.user_notes_count // 0) } ];
 
+# Gitea's issue search answers pulls and issues from one endpoint and one row
+# shape, so both queues share this. It reports no review decision anywhere in
+# the search response, so `review` stays empty rather than guessing.
+def gitea_items($rows; $viewer):
+  [ $rows[]? | select((.html_url // "") != "") |
+    { number: (.number // 0),
+      title: (.title // ""),
+      repository: (.repository.full_name // ""),
+      url: .html_url,
+      updatedAt: (.updated_at // ""),
+      draft: (.pull_request.draft // false),
+      author: other_author((.user.login // ""); $viewer),
+      review: "",
+      comments: (.comments // 0) } ];
+
 def counts_from_github_calendar:
   [ .weeks[]?.contributionDays[]? | {key: .date, value: .contributionCount} ]
   | from_entries;
+
+# Gitea's heatmap is a flat list of {timestamp, contributions} buckets, several
+# per day, so the day totals are summed rather than read off directly.
+def counts_from_gitea_heatmap:
+  [ .[]? | select((.timestamp // null) != null)
+    | {key: (.timestamp | gmtime | strftime("%Y-%m-%d")), value: (.contributions // 0)} ]
+  | group_by(.key) | map({key: .[0].key, value: (map(.value) | add)}) | from_entries;
 
 def counts_from_gitlab_events:
   [ .[]? | .created_at // "" | select(length >= 10) | .[0:10] ]

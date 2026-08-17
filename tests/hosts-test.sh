@@ -62,6 +62,29 @@ assert_eq "" "$(yaml_keys_at "$fixtures/does-not-exist.yml" "" 0)" "a missing fi
 printf 'hosts:\n\tgitlab.com:\n' >"$fixtures/tabs.yml"
 assert_eq "" "$(yaml_keys_at "$fixtures/tabs.yml" hosts 4)" "tab-indented input is refused"
 
+# `tea` keeps a list of logins rather than a map, each with its own token.
+cat >"$fixtures/tea.yml" <<'YAML'
+logins:
+    - name: work
+      url: https://git.example.com
+      token: aaa
+      default: false
+    - name: home
+      url: https://tea.example.org/
+      token: bbb
+      default: true
+preferences:
+    editor: false
+YAML
+mkdir -p "$fixtures/teacfg/tea"
+cp "$fixtures/tea.yml" "$fixtures/teacfg/tea/config.yml"
+assert_eq "https://git.example.com|aaa|false https://tea.example.org/|bbb|true" \
+  "$(XDG_CONFIG_HOME="$fixtures/teacfg" tea_logins | tr '\t' '|' | tr '\n' ' ' | sed 's/ $//')" \
+  "every tea login yields its url, token and default flag"
+
+assert_eq "" "$(XDG_CONFIG_HOME="$fixtures/empty-tea" tea_logins)" \
+  "a missing tea config yields no logins"
+
 # --- normalization ---------------------------------------------------------
 
 assert_eq "github.com" "$(printf 'GitHub.com\n' | dedupe)" "hosts are lowercased"
@@ -90,6 +113,8 @@ assert_eq "ghe.example.com" "$(GH_HOST="" GITHUB_HOST=ghe.example.com github_hos
 assert_eq "gl.example.com" "$(GITLAB_HOST=gl.example.com gitlab_hosts)" "GITLAB_HOST wins outright"
 assert_eq "gitlab.com" "$(GITLAB_HOST=https://GitLab.com/ gitlab_hosts)" \
   "an explicit host is normalized like any other"
+assert_eq "tea.example.com" "$(GITEA_HOST=https://Tea.example.com/ gitea_hosts)" \
+  "GITEA_HOST wins outright and is normalized"
 
 # With a config present, every host the CLI knows about is collected.
 mkdir -p "$fixtures/cfg/gh" "$fixtures/cfg/glab-cli"
@@ -101,6 +126,24 @@ assert_eq "github.com ghe.example.com" \
 assert_eq "gitlab.com git.example.com" \
   "$(GITLAB_HOST="" XDG_CONFIG_HOME="$fixtures/cfg" gitlab_hosts | tr '\n' ' ' | sed 's/ $//')" \
   "every configured GitLab host is discovered"
+
+# Gitea has no canonical host at all, so the login marked default leads.
+assert_eq "tea.example.org git.example.com" \
+  "$(GITEA_HOST="" XDG_CONFIG_HOME="$fixtures/teacfg" gitea_hosts | tr '\n' ' ' | sed 's/ $//')" \
+  "the default tea login is ordered first"
+
+# The token is looked up per host, so two instances never borrow each other's.
+assert_eq "aaa" "$(GITEA_TOKEN="" XDG_CONFIG_HOME="$fixtures/teacfg" gitea_token git.example.com)" \
+  "each Gitea host gets its own token"
+assert_eq "bbb" "$(GITEA_TOKEN="" XDG_CONFIG_HOME="$fixtures/teacfg" gitea_token tea.example.org)" \
+  "a trailing slash in the config does not hide the match"
+GITEA_TOKEN="" XDG_CONFIG_HOME="$fixtures/teacfg" gitea_token nope.example.com >/dev/null
+assert_eq "1" "$?" "an unknown Gitea host has no token"
+assert_eq "envtoken" "$(GITEA_TOKEN=envtoken XDG_CONFIG_HOME="$fixtures/teacfg" gitea_token anything)" \
+  "GITEA_TOKEN covers every host when no GITEA_HOST pins it"
+assert_eq "aaa" \
+  "$(GITEA_TOKEN=envtoken GITEA_HOST=other.example XDG_CONFIG_HOME="$fixtures/teacfg" gitea_token git.example.com)" \
+  "a pinned GITEA_TOKEN does not leak onto another host"
 
 # A self-managed instance alone still sorts stably, with no canonical host to
 # lead it.

@@ -6,7 +6,7 @@ import Quickshell.Io
 // collector at bin/gitwork, which writes one JSON overview covering every
 // configured host; this file runs it on a schedule, watches the file it
 // writes, and exposes the records grouped the way the panel presents them:
-// one group per provider (GitHub, GitLab), each holding one or more hosts.
+// one group per provider (GitHub, GitLab, Gitea), each holding one or more hosts.
 Item {
   id: root
   visible: false
@@ -203,8 +203,8 @@ Item {
       authHelpText: String(record.authHelpText || ""),
       error: String(record.error || ""),
       updatedAt: String(record.updatedAt || ""),
-      mrTerm: String(record.mrTerm || (kind === "github" ? "Pull requests" : "Merge requests")),
-      mrTermShort: String(record.mrTermShort || (kind === "github" ? "PRs" : "MRs")),
+      mrTerm: String(record.mrTerm || (kind === "gitlab" ? "Merge requests" : "Pull requests")),
+      mrTermShort: String(record.mrTermShort || (kind === "gitlab" ? "MRs" : "PRs")),
       calendar: normalizeCalendar(record.calendar),
       reviewRequests: normalizeItems(record.reviewRequests),
       assignedPrs: normalizeItems(record.assignedPrs),
@@ -229,7 +229,7 @@ Item {
   }
 
   // One group per provider, holding every host configured for it. The panel
-  // shows groups as tabs (so a tab is always just "GitHub" or "GitLab") and
+  // shows groups as tabs (so a tab is always just "GitHub", "GitLab" or "Gitea") and
   // hosts as a switch inside the selected tab.
   function computedGroups() {
     var list = root.providers

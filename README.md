@@ -1,8 +1,8 @@
 # dev.git — Git dashboard bar widget for Omarchy
 
-A native [Omarchy](https://omarchy.org) shell bar widget that watches GitHub and
-GitLab for open work: a full-year contribution graph, review queues, and your
-own pull and merge requests, all in one panel.
+A native [Omarchy](https://omarchy.org) shell bar widget that watches GitHub,
+GitLab and Gitea for open work: a full-year contribution graph, review queues,
+and your own pull and merge requests, all in one panel.
 
 ![The dev.git panel showing the GitHub and GitLab tabs side by side](preview.png)
 
@@ -11,8 +11,8 @@ own pull and merge requests, all in one panel.
 - **Full-year activity graph** — trailing 53 weeks, quartile-shaded, with
   per-day tooltips, streaks and today's count
 - **Multiple hosts per provider** — GitHub Enterprise and self-managed GitLab
-  are discovered from `gh`/`glab` config, each with its own identity, graph and
-  queues, behind a host switch inside the tab
+  and Gitea are discovered from `gh`/`glab`/`tea` config, each with its own
+  identity, graph and queues, behind a host switch inside the tab
 - **Open-work grid** — awaiting review, assigned PRs/MRs, assigned and authored
   issues; each click opens the pre-filtered queue page
 - **Queue rows** carrying draft tag, approval check, comment count, repository,
@@ -26,11 +26,12 @@ own pull and merge requests, all in one panel.
 omarchy plugin add https://github.com/ariadev/omarchy-dev-git.git --enable --yes
 ```
 
-Needs `curl` and `jq`, plus [gh](https://cli.github.com/) and/or
-[glab](https://gitlab.com/gitlab-org/cli) signed in — the collector reads the
-credentials those CLIs already hold and never stores a token of its own. Both
-are optional: each provider is collected independently, so a missing or
-unauthenticated one never hides the others.
+Needs `curl` and `jq`, plus any of [gh](https://cli.github.com/),
+[glab](https://gitlab.com/gitlab-org/cli) and [tea](https://gitea.com/gitea/tea)
+signed in — the collector reads the credentials those CLIs already hold and
+never stores a token of its own. All three are optional: each provider is
+collected independently, so a missing or unauthenticated one never hides the
+others.
 
 Nothing is compiled or installed. Clone it and it runs.
 
@@ -71,7 +72,10 @@ bash script with its JSON transforms in `bin/gitwork.jq`.
 GitHub needs one GraphQL request per host for identity, calendar and all five
 queues. GitLab takes one GraphQL request for identity and merge requests, REST
 for issues, and the events feed for the calendar — it has no calendar API — with
-page one reporting the page count so the rest are fetched together.
+page one reporting the page count so the rest are fetched together. Gitea has no
+GraphQL at all, but its issue search takes each queue as query parameters and
+answers pulls and issues from one row shape, so identity comes first and then
+the five queues and the heatmap fly together.
 
 Every host is collected in its own subshell, so a run costs the slowest single
 host rather than the sum of them. A host that cannot be reached carries its last

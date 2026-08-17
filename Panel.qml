@@ -5,7 +5,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
-// Git dashboard. One tab per provider (GitHub, GitLab) with a host switch
+// Git dashboard. One tab per provider (GitHub, GitLab, Gitea) with a host switch
 // inside it, a full-year contribution graph, a grid of open-work counts, and
 // the queues of what is actually waiting on you.
 Panel {
@@ -336,6 +336,17 @@ Panel {
       if (category === "assignedIssues") return issues + encodeURIComponent("assignee:@me")
       if (category === "authoredIssues") return issues + encodeURIComponent("author:@me")
       return prs + encodeURIComponent("author:@me")
+    }
+    // Gitea's dashboard takes the whole queue in one `type`, and uses the same
+    // two pages for issues and pulls that its API search does.
+    if (p.kind === "gitea") {
+      var giteaPrs = origin + "/pulls?state=open&type="
+      var giteaIssues = origin + "/issues?state=open&type="
+      if (category === "review") return giteaPrs + "review_requested"
+      if (category === "assigned") return giteaPrs + "assigned"
+      if (category === "assignedIssues") return giteaIssues + "assigned"
+      if (category === "authoredIssues") return giteaIssues + "created_by"
+      return giteaPrs + "created_by"
     }
     var user = encodeURIComponent(p.username)
     var mrQueue = origin + "/dashboard/merge_requests?state=opened"
