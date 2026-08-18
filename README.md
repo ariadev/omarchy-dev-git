@@ -44,6 +44,7 @@ Nothing is compiled or installed. Clone it and it runs.
 | `[` / `]` | Previous / next host          |
 | `g` / `G` | First / last row              |
 | `Enter`   | Open the selected row         |
+| `p`       | Pin the provider tab first    |
 | `r`       | Refresh now                   |
 | `Tab`     | Neighbouring panel            |
 | `Esc`     | Close                         |

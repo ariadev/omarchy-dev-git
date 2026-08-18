@@ -19,6 +19,7 @@ Item {
   readonly property string stateHome: Quickshell.env("XDG_STATE_HOME") || home + "/.local/state"
   readonly property string stateDir: stateHome + "/omarchy/git"
   readonly property string overviewPath: stateDir + "/overview.json"
+  readonly property string prefsPath: stateDir + "/panel.json"
   // Resolved from this file's own location rather than a hardcoded plugin
   // path, so a renamed install directory or an `omarchy dev link` checkout
   // still finds its collector.
@@ -37,6 +38,10 @@ Item {
   property string collectorError: ""
 
   readonly property bool loading: updateProcess.running
+
+  // Provider kind the user pinned, so the tab they actually work in leads the
+  // row and opens by default. Empty means "keep the collector's order".
+  property string pinnedKind: ""
 
   property var providers: computedProviders()
   property var groups: computedGroups()
@@ -232,6 +237,7 @@ Item {
   // shows groups as tabs (so a tab is always just "GitHub", "GitLab" or "Gitea") and
   // hosts as a switch inside the selected tab.
   function computedGroups() {
+    var pinned = root.pinnedKind  // reactive dependency
     var list = root.providers
     var order = []
     var byKind = ({})
@@ -245,7 +251,41 @@ Item {
     }
     var groups = []
     for (var j = 0; j < order.length; j++) groups.push(byKind[order[j]])
+    // The pinned provider leads; everything else keeps the collector's order.
+    for (var k = 0; k < groups.length; k++) {
+      if (groups[k].kind !== pinned) continue
+      groups.unshift(groups.splice(k, 1)[0])
+      break
+    }
     return groups
+  }
+
+  // --------------------------------------------------------- pin persistence
+
+  function togglePin(kind) {
+    if (kind === "") return
+    root.pinnedKind = root.pinnedKind === kind ? "" : kind
+    prefsFile.setText(JSON.stringify({ pinnedKind: root.pinnedKind }, null, 2) + "\n")
+  }
+
+  function loadPrefs(content) {
+    try {
+      var parsed = JSON.parse(String(content || "{}"))
+      root.pinnedKind = parsed && typeof parsed === "object" ? String(parsed.pinnedKind || "") : ""
+    } catch (e) {
+      root.pinnedKind = ""
+    }
+  }
+
+  FileView {
+    id: prefsFile
+    path: root.prefsPath
+    watchChanges: false
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.loadPrefs(text())
+    // First run: no file yet, and nothing to restore.
+    onLoadFailed: root.pinnedKind = ""
   }
 
   // The host a group should open on: the first signed-in one, so a configured

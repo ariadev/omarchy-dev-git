@@ -32,6 +32,9 @@ Panel {
   // ---------------------------------------------------------------- selection
 
   readonly property var groups: data.groups
+  // Mirrored onto the root: inside a Button delegate `data` resolves to the
+  // item's own default property, not this file's Main instance.
+  readonly property string pinnedKind: data.pinnedKind
 
   // Which provider tab is showing, and which host inside each tab. Host choice
   // is remembered per provider so flipping between tabs never resets it.
@@ -71,6 +74,17 @@ Panel {
   function selectKind(kind) {
     if (kind === "" || kind === root.selectedKind) return
     root.selectedKind = kind
+  }
+
+  // Pin the tab the user actually works in: it leads the row and is what the
+  // panel opens on. Pinning follows the selection, so the tab stays put under
+  // the cursor after the row reorders.
+  function pinCurrentGroup() { root.pinGroup(root.group ? root.group.kind : "") }
+
+  function pinGroup(kind) {
+    if (kind === "") return
+    root.selectKind(kind)
+    data.togglePin(kind)
   }
 
   function stepGroup(delta) {
@@ -491,6 +505,7 @@ Panel {
         // 1-9 jumps straight to a host, which beats stepping through a long
         // list of self-managed instances one at a time.
         else if (t >= "1" && t <= "9") root.jumpHost(t.charCodeAt(0) - 49)
+        else if (t === "p" || t === "P") root.pinCurrentGroup()
         else if (t === "g") root.jumpRows(0)
         else if (t === "G") root.jumpRows(root.focusRows.length - 1)
       }
@@ -534,7 +549,12 @@ Panel {
                 width: providerTabs.cellWidth
                 // Just the provider name: which host is in play is the host
                 // switch's job, not the tab's.
-                text: modelData.name
+                // A pinned tab says so with a dot ahead of the name; the
+                // hover tooltip is where the key itself is taught.
+                text: (modelData.kind === root.pinnedKind ? "· " : "") + modelData.name
+                tooltipText: modelData.kind === root.pinnedKind
+                  ? "Pinned first  ·  p to unpin"
+                  : "p to pin " + modelData.name + " first"
                 selected: index === root.groupIndex
                 hasCursor: root.focusZone === "provider" && index === root.groupIndex
                 bordered: true
@@ -543,6 +563,7 @@ Panel {
                 fontSize: Style.font.bodySmall
                 verticalPadding: Style.spacing.controlPaddingY
                 onClicked: root.selectKind(modelData.kind)
+                onRightClicked: root.pinGroup(modelData.kind)
               }
             }
           }
