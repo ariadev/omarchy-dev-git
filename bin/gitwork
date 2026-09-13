@@ -407,7 +407,7 @@ query {
     username
     name
     webUrl
-    reviewRequestedMergeRequests(state: opened, first: 50, sort: UPDATED_DESC) { count nodes { ...mr } }
+    reviewRequestedMergeRequests(state: opened, reviewStates: [UNREVIEWED, REVIEWED, REVIEW_STARTED, REQUESTED_CHANGES, UNAPPROVED], first: 50, sort: UPDATED_DESC) { count nodes { ...mr } }
     assignedMergeRequests(state: opened, first: 50, sort: UPDATED_DESC) { count nodes { ...mr } }
     authoredMergeRequests(state: opened, first: 50, sort: UPDATED_DESC) { count nodes { ...mr } }
   }
