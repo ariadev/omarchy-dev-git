@@ -365,7 +365,7 @@ Panel {
     var user = encodeURIComponent(p.username)
     var mrQueue = origin + "/dashboard/merge_requests?state=opened"
     var issueQueue = origin + "/dashboard/issues?state=opened"
-    if (category === "review") return mrQueue + "&reviewer_username=" + user
+    if (category === "review") return origin + "/dashboard/merge_requests/search?scope=all&state=opened&reviewer_username=" + user + "&not[approved_by_usernames][]=" + user
     if (category === "assigned") return mrQueue + "&assignee_username=" + user
     if (category === "assignedIssues") return issueQueue + "&assignee_username=" + user
     if (category === "authoredIssues") return issueQueue + "&author_username=" + user
