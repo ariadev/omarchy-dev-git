@@ -136,6 +136,13 @@ run_dead -output "$out" >/dev/null
 assert_eq "0" "$(jq -e . "$out" >/dev/null 2>&1; echo $?)" "a repeat run leaves valid JSON"
 assert_eq "3" "$(jq -r .schemaVersion "$out")" "a repeat run keeps the schema version"
 
+# A corrupt previous document does not abort the run and self-heals
+printf '{"schemaVersion": 3, "updatedAt": "2026-01-01T00:00:00Z", "providers": []}}\n' >"$out"
+run_dead -output "$out" >/dev/null
+assert_eq "0" "$(jq -e . "$out" >/dev/null 2>&1; echo $?)" "a corrupt previous file is replaced with valid JSON"
+assert_eq "3" "$(jq -r .schemaVersion "$out")" "self-healed run keeps the schema version"
+assert_contains "$(cat "$work/stderr")" "gitwork: warning" "a corrupt previous file emits a warning"
+
 # --- formatting ------------------------------------------------------------
 
 assert_eq "1" "$(run_dead -pretty false | wc -l)" "compact output is one line"

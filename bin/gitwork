@@ -786,7 +786,11 @@ fi
 
 previous='null'
 if [[ -n $output && -r $output ]]; then
-  previous=$(jq -c . "$output" 2>/dev/null || echo 'null')
+  if prev_val=$(jq -c -s 'if length == 1 and (.[0] | type == "object") then .[0] else empty end' "$output" 2>/dev/null) && [[ -n $prev_val ]]; then
+    previous="$prev_val"
+  elif [[ -s $output ]]; then
+    echo "gitwork: warning: previous overview at $output is invalid JSON; ignoring" >&2
+  fi
 fi
 
 document=$(jqm -n \
