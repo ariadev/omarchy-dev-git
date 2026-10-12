@@ -37,7 +37,7 @@ chmod +x "$STUB_PATH/gh" "$STUB_PATH/glab"
 # the auth gate and into the HTTP failure paths.
 run_dead() {
   env -i HOME="$HOME" PATH="$STUB_PATH" XDG_CONFIG_HOME="$work/none" \
-      GH_HOST="$DEAD" GITLAB_HOST="$DEAD" \
+      GH_HOST="http://$DEAD" GITLAB_HOST="http://$DEAD" \
       bash "$COLLECTOR" "$@" 2>"$work/stderr"
 }
 
@@ -69,7 +69,7 @@ assert_eq "2" "$(jq -r '.providers | length' <<<"$doc")" "both providers are pre
 required='["key","kind","name","host","hostLabel","defaultHost","ready","stale","staleAt",
   "username","displayName","webUrl","userUrl","authHelpText","error","updatedAt","elapsedMs",
   "mrTerm","mrTermShort","calendar","reviewRequests","assignedPrs","authoredPrs",
-  "assignedIssues","authoredIssues","totals"]'
+  "assignedIssues","authoredIssues","organizations","totals"]'
 assert_eq "0" "$(jq -r --argjson want "$required" \
   '[.providers[] | keys_unsorted as $have | $want - $have] | flatten | length' <<<"$doc")" \
   "every provider carries every field the panel reads"
@@ -102,6 +102,8 @@ assert_eq "github gitlab" "$(jq -r '[.providers[].kind] | join(" ")' <<<"$doc")"
   "providers are ordered GitHub then GitLab"
 assert_eq "true true" "$(jq -r '[.providers[].defaultHost] | join(" ")' <<<"$doc")" \
   "the first host of each provider is its default"
+assert_eq "true" "$(jq -r '[.providers[].webUrl | startswith("http://")] | all' <<<"$doc")" \
+  "explicit HTTP origins reach the final provider records"
 
 # --- missing credentials ---------------------------------------------------
 

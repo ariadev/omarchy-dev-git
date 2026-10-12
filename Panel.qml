@@ -6,8 +6,8 @@ import qs.Commons
 import qs.Ui
 
 // Git dashboard. One tab per provider (GitHub, GitLab, Gitea) with a host switch
-// inside it, a full-year contribution graph, a grid of open-work counts, and
-// the queues of what is actually waiting on you.
+// inside it, a full-year contribution graph, Gitea organization activity, a
+// grid of open-work counts, and the queues of what is actually waiting on you.
 Panel {
   id: root
   moduleName: "dev.git"
@@ -341,7 +341,7 @@ Panel {
   function categoryUrl(category) {
     var p = root.provider
     if (!p) return ""
-    var origin = root.originOf(p.webUrl) || "https://" + p.host
+    var origin = String(p.webUrl || "https://" + p.host).replace(/\/+$/, "")
     if (p.kind === "github") {
       var prs = origin + "/pulls?q=" + encodeURIComponent("is:open is:pr ")
       var issues = origin + "/issues?q=" + encodeURIComponent("is:open is:issue ")
@@ -370,11 +370,6 @@ Panel {
     if (category === "assignedIssues") return issueQueue + "&assignee_username=" + user
     if (category === "authoredIssues") return issueQueue + "&author_username=" + user
     return mrQueue + "&author_username=" + user
-  }
-
-  function originOf(url) {
-    var match = String(url || "").match(/^(https?:\/\/[^/]+)/)
-    return match ? match[1] : ""
   }
 
   // A white provider mark belongs on a dark panel and a dark one on a light
@@ -922,6 +917,112 @@ Panel {
             }
           }
 
+          // ---------- Gitea organization activity ----------
+          PanelSeparator {
+            visible: organizationSection.visible
+            foreground: root.foreground
+          }
+
+          Column {
+            id: organizationSection
+            visible: !!root.provider && root.provider.organizations.length > 0
+            width: parent.width
+            spacing: Style.space(10)
+
+            PanelSectionHeader {
+              width: parent.width
+              text: "ORGANIZATION ACTIVITY"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Repeater {
+              model: root.provider ? root.provider.organizations : []
+
+              Column {
+                id: organization
+                required property var modelData
+                required property int index
+
+                width: organizationSection.width
+                spacing: Style.space(7)
+
+                Item {
+                  width: parent.width
+                  implicitHeight: Math.max(orgName.implicitHeight, orgCount.implicitHeight)
+
+                  Text {
+                    id: orgName
+                    anchors.left: parent.left
+                    anchors.right: orgCount.left
+                    anchors.rightMargin: Style.space(10)
+                    text: organization.modelData.displayName !== ""
+                      ? organization.modelData.displayName + " · " + organization.modelData.name
+                      : organization.modelData.name
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                    elide: Text.ElideRight
+                  }
+
+                  Text {
+                    id: orgCount
+                    anchors.right: parent.right
+                    anchors.baseline: orgName.baseline
+                    text: organization.modelData.activityAvailable
+                      ? root.plural(organization.modelData.recentPushes, "recent push", "recent pushes")
+                      : "Activity unavailable"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.openUrl(organization.modelData.webUrl)
+                  }
+                }
+
+                Text {
+                  visible: !organization.modelData.membersAvailable
+                  width: parent.width
+                  text: "Member list unavailable"
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                Grid {
+                  id: memberGrid
+                  width: parent.width
+                  columns: 2
+                  columnSpacing: Style.space(8)
+                  rowSpacing: Style.space(8)
+
+                  readonly property real cellWidth: (width - columnSpacing) / 2
+
+                  Repeater {
+                    model: organization.modelData.members
+
+                    MemberBox {
+                      required property var modelData
+                      required property int index
+
+                      width: memberGrid.cellWidth
+                      member: modelData
+                      activityAvailable: organization.modelData.activityAvailable
+                      self: !!root.provider
+                        && modelData.username.toLowerCase() === root.provider.username.toLowerCase()
+                      onActivated: root.openUrl(modelData.url)
+                    }
+                  }
+                }
+              }
+            }
+          }
+
           // ---------- Open work ----------
           PanelSeparator {
             visible: workSection.visible
@@ -1301,6 +1402,95 @@ Panel {
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
       onClicked: statBox.activated()
+    }
+  }
+
+  // One member of a Gitea organization, ranked by push events in the recent
+  // organization feed. The zero state is intentional: it distinguishes a
+  // quiet member from somebody missing from the roster.
+  component MemberBox: CursorSurface {
+    id: memberBox
+
+    property var member: null
+    property bool activityAvailable: true
+    property bool self: false
+    signal activated()
+
+    readonly property int pushes: member ? Number(member.pushes || 0) : 0
+    readonly property string latestRepository: member ? String(member.latestRepository || "") : ""
+    readonly property string latestAt: member ? String(member.latestAt || "") : ""
+
+    foreground: root.foreground
+    hasCursor: memberHover.containsMouse
+    bordered: true
+    implicitHeight: Math.max(Style.space(48),
+      memberName.implicitHeight + memberMeta.implicitHeight + Style.spacing.md * 2)
+
+    Column {
+      anchors.left: parent.left
+      anchors.right: pushCount.left
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(2)
+
+      Text {
+        id: memberName
+        width: parent.width
+        text: memberBox.member
+          ? "@" + memberBox.member.username + (memberBox.self ? " · you" : "") : ""
+        color: memberBox.pushes > 0 ? root.foreground : root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        font.bold: true
+        elide: Text.ElideRight
+      }
+
+      Text {
+        id: memberMeta
+        width: parent.width
+        text: !memberBox.activityAvailable ? "Activity unavailable"
+          : memberBox.latestRepository !== ""
+          ? memberBox.latestRepository + " · " + root.timeAgo(memberBox.latestAt, root.nowMs)
+          : "No pushes in recent feed"
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+      }
+    }
+
+    Text {
+      id: pushCount
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(10)
+      anchors.verticalCenter: parent.verticalCenter
+      text: memberBox.activityAvailable ? String(memberBox.pushes) : "—"
+      color: memberBox.pushes > 0 ? root.foreground : root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.title
+      font.bold: true
+    }
+
+    MouseArea {
+      id: memberHover
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: memberBox.activated()
+    }
+
+    PanelToolTip {
+      visible: memberHover.containsMouse
+      text: {
+        if (!memberBox.member) return ""
+        var parts = []
+        if (memberBox.member.displayName) parts.push(memberBox.member.displayName)
+        if (memberBox.member.latestRef) parts.push(memberBox.member.latestRef)
+        return parts.join(" · ")
+      }
+      fontFamily: root.fontFamily
+      delay: 350
     }
   }
 

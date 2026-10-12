@@ -88,24 +88,75 @@ assert_json_eq '{
 # One endpoint and one row shape answers both pulls and issues, so the same
 # transform has to carry a draft pull and a plain issue.
 gt_rows='[
-  {"number":11,"title":"Add tea","html_url":"https://git.example.com/o/r/pulls/11",
+  {"number":11,"title":"Add tea","html_url":"http://gitea.internal:3000/o/r/pulls/11",
    "updated_at":"2026-08-04T00:00:00Z","comments":3,"user":{"login":"other"},
    "repository":{"full_name":"o/r"},"pull_request":{"draft":true,"merged":false}},
   {"number":12,"title":"No url","html_url":""}
 ]'
-gt=$(jqlib 'gitea_items($n; "ariadev")' --argjson n "$gt_rows")
+gt=$(jqlib 'gitea_items($n; "ariadev"; "http://git.example.com:3000")' --argjson n "$gt_rows")
 assert_eq "1" "$(jq -r 'length' <<<"$gt")" "a Gitea row without a url is dropped"
 assert_json_eq '{
-  "number":11,"title":"Add tea","repository":"o/r","url":"https://git.example.com/o/r/pulls/11",
+  "number":11,"title":"Add tea","repository":"o/r","url":"http://git.example.com:3000/o/r/pulls/11",
   "updatedAt":"2026-08-04T00:00:00Z","draft":true,"author":"other","review":"","comments":3}' \
-  "$(jq -c '.[0]' <<<"$gt")" "a Gitea pull maps onto the shared item shape"
+  "$(jq -c '.[0]' <<<"$gt")" "a Gitea pull maps onto the shared shape and configured origin"
 
 assert_eq "false" \
-  "$(jqlib 'gitea_items([{"number":1,"html_url":"u"}]; "me") | .[0].draft')" \
+  "$(jqlib 'gitea_items([{"number":1,"html_url":"u"}]; "me"; "http://g") | .[0].draft')" \
   "an issue carries no pull_request block and is never a draft"
-assert_eq "" "$(jqlib 'gitea_items([{"number":1,"html_url":"u","user":null}]; "me") | .[0].author')" \
+assert_eq "" "$(jqlib 'gitea_items([{"number":1,"html_url":"u","user":null}]; "me"; "http://g") | .[0].author')" \
   "a deleted Gitea author is empty, not null"
-assert_json_eq '[]' "$(jqlib 'gitea_items(null; "me")')" "a missing Gitea queue yields no rows"
+assert_json_eq '[]' "$(jqlib 'gitea_items(null; "me"; "http://g")')" "a missing Gitea queue yields no rows"
+
+# --- Gitea organizations ---------------------------------------------------
+
+gt_org='{"username":"example-org","full_name":"Example Organization","description":"members"}'
+gt_members='[
+  {"login":"quiet","full_name":"Quiet Member","active":true},
+  {"login":"alice","full_name":"Alice","active":true},
+  {"login":"bob","full_name":"Bob","active":true}
+]'
+gt_events='[
+  {"op_type":"commit_repo","created":"2026-08-20T14:40:42-06:00",
+   "act_user":{"login":"alice","full_name":"Alice"},
+   "repo":{"full_name":"example-org/project"},"ref_name":"refs/heads/feature/a"},
+  {"op_type":"commit_repo","created":"2026-08-19T12:00:00-06:00",
+   "act_user":{"login":"alice","full_name":"Alice"},
+   "repo":{"full_name":"example-org/dev.git"},"ref_name":"refs/heads/main"},
+  {"op_type":"commit_repo","created":"2026-08-18T12:00:00-06:00",
+   "act_user":{"login":"bob","full_name":"Bob"},
+   "repo":{"full_name":"example-org/project"},"ref_name":"refs/heads/fix"},
+  {"op_type":"create_repo","created":"2026-08-21T12:00:00-06:00",
+   "act_user":{"login":"quiet"},"repo":{"full_name":"example-org/new"}}
+]'
+gt_organization=$(jqlib \
+  'gitea_organization($org; $members; $events; "http://git.example.com:3000")' \
+  --argjson org "$gt_org" --argjson members "$gt_members" --argjson events "$gt_events")
+assert_eq "example-org|3|alice bob quiet" \
+  "$(jq -r '[.name,.recentPushes,([.members[].username]|join(" "))] | join("|")' <<<"$gt_organization")" \
+  "organization members are sorted by recent push activity and quiet members remain"
+assert_eq "2|example-org/project|feature/a|http://git.example.com:3000/example-org/project" \
+  "$(jq -r '.members[0] | [.pushes,.latestRepository,.latestRef,.latestUrl] | join("|")' <<<"$gt_organization")" \
+  "a member carries its latest push context on the configured origin"
+assert_eq "0||" \
+  "$(jq -r '.members[2] | [.pushes,.latestAt,.latestRepository] | join("|")' <<<"$gt_organization")" \
+  "a quiet organization member has an explicit zero and no invented activity"
+assert_eq "http://public:3000/example-org/repo" \
+  "$(jqlib 'rewrite_origin("http://private:3000/example-org/repo"; "http://public:3000")')" \
+  "Gitea API links are rewritten from a private bind address"
+assert_eq "https://git.example.com/Code/o/r/issues/5" \
+  "$(jqlib 'gitea_items([{number:5, repository:{full_name:"o/r"},
+    html_url:"http://internal/o/r/issues/5"}]; "me"; "https://git.example.com/Code") | .[0].url')" \
+  "queue links use the configured subpath even when the API advertises another base"
+assert_eq "https://git.example.com/Code/o/r/pulls/11" \
+  "$(jqlib 'gitea_items($n; "me"; "https://git.example.com/Code") | .[0].url' --argjson n "$gt_rows")" \
+  "pull links keep the configured subpath"
+assert_eq "https://git.example.com/Code/o/r/issues/5" \
+  "$(jqlib 'rewrite_origin("http://internal/Code/o/r/issues/5"; "https://git.example.com/Code")')" \
+  "fallback links do not duplicate a subpath"
+assert_eq "alice bob quiet" \
+  "$(jqlib 'gitea_org_members($members + [{login:"ALICE"}]; $events; "https://git.example.com")
+    | map(.username | ascii_downcase) | join(" ")' --argjson members "$gt_members" --argjson events "$gt_events")" \
+  "members and feed actors are deduplicated case-insensitively"
 
 # --- calendar count extraction ---------------------------------------------
 
@@ -136,23 +187,23 @@ assert_json_eq '{}' "$(jqlib '[{"contributions":3},{}] | counts_from_gitea_heatm
 # --- the base record -------------------------------------------------------
 
 for kind in github gitlab gitea; do
-  base=$(jqlib "base_provider(\"$kind\"; \"example.com\"; false)")
+  base=$(jqlib "base_provider(\"$kind\"; \"example.com\"; \"http://example.com\"; false)")
   assert_eq "$kind@example.com" "$(jq -r .key <<<"$base")" "$kind key is kind@host"
   assert_eq "false" "$(jq -r .ready <<<"$base")" "$kind starts unready"
-  assert_eq "https://example.com" "$(jq -r .webUrl <<<"$base")" "$kind web url defaults to the host"
+  assert_eq "http://example.com" "$(jq -r .webUrl <<<"$base")" "$kind keeps its configured origin"
   assert_eq "0" "$(jq -r '[.reviewRequests,.assignedPrs,.authoredPrs,.assignedIssues,.authoredIssues]
     | map(length) | add' <<<"$base")" "$kind starts with empty queues"
 done
 
-assert_eq "GitHub" "$(jqlib 'base_provider("github"; "h"; true) | .name')" "GitHub is named"
-assert_eq "GitLab" "$(jqlib 'base_provider("gitlab"; "h"; true) | .name')" "GitLab is named"
-assert_eq "Gitea" "$(jqlib 'base_provider("gitea"; "h"; true) | .name')" "Gitea is named"
+assert_eq "GitHub" "$(jqlib 'base_provider("github"; "h"; "https://h"; true) | .name')" "GitHub is named"
+assert_eq "GitLab" "$(jqlib 'base_provider("gitlab"; "h"; "https://h"; true) | .name')" "GitLab is named"
+assert_eq "Gitea" "$(jqlib 'base_provider("gitea"; "h"; "https://h"; true) | .name')" "Gitea is named"
 
-assert_eq "Pull requests" "$(jqlib 'base_provider("github"; "h"; true) | .mrTerm')" "GitHub says pull requests"
-assert_eq "Pull requests" "$(jqlib 'base_provider("gitea"; "h"; true) | .mrTerm')" "Gitea says pull requests too"
-assert_eq "Merge requests" "$(jqlib 'base_provider("gitlab"; "h"; true) | .mrTerm')" "GitLab says merge requests"
-assert_eq "PRs" "$(jqlib 'base_provider("github"; "h"; true) | .mrTermShort')" "GitHub short term"
-assert_eq "MRs" "$(jqlib 'base_provider("gitlab"; "h"; true) | .mrTermShort')" "GitLab short term"
-assert_eq "PRs" "$(jqlib 'base_provider("gitea"; "h"; true) | .mrTermShort')" "Gitea short term"
+assert_eq "Pull requests" "$(jqlib 'base_provider("github"; "h"; "https://h"; true) | .mrTerm')" "GitHub says pull requests"
+assert_eq "Pull requests" "$(jqlib 'base_provider("gitea"; "h"; "https://h"; true) | .mrTerm')" "Gitea says pull requests too"
+assert_eq "Merge requests" "$(jqlib 'base_provider("gitlab"; "h"; "https://h"; true) | .mrTerm')" "GitLab says merge requests"
+assert_eq "PRs" "$(jqlib 'base_provider("github"; "h"; "https://h"; true) | .mrTermShort')" "GitHub short term"
+assert_eq "MRs" "$(jqlib 'base_provider("gitlab"; "h"; "https://h"; true) | .mrTermShort')" "GitLab short term"
+assert_eq "PRs" "$(jqlib 'base_provider("gitea"; "h"; "https://h"; true) | .mrTermShort')" "Gitea short term"
 
 finish

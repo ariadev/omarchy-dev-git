@@ -93,6 +93,32 @@ assert_eq "gitlab.com" "$(printf 'http://gitlab.com\n' | dedupe)" "http is strip
 assert_eq "a.com b.com" "$(printf 'a.com\nb.com\nA.com\n' | dedupe | tr '\n' ' ' | sed 's/ $//')" \
   "duplicates are dropped, first-seen order kept"
 assert_eq "" "$(printf '\n\n' | dedupe)" "blank lines yield nothing"
+assert_eq "git.example.com/Code" "$(printf 'https://Git.Example.com/Code///\n' | dedupe)" \
+  "a configured subpath keeps its case"
+
+# The host stays scheme-free for credential lookup, while request and browser
+# URLs retain an explicitly configured HTTP origin.
+assert_eq "http://local.example:3000" \
+  "$(origin_from 'http://local.example:3000/' 'local.example:3000')" \
+  "an explicit HTTP origin is preserved"
+assert_eq "https://local.example" "$(origin_from 'local.example' 'local.example')" \
+  "a host without a scheme stays HTTPS"
+assert_eq "http://ghe.local" "$(GH_HOST=http://ghe.local github_origin ghe.local)" \
+  "a GitHub host override can opt into HTTP"
+assert_eq "http://gitlab.local" "$(GITLAB_HOST=http://gitlab.local gitlab_origin gitlab.local)" \
+  "a GitLab host override can opt into HTTP"
+assert_eq "http://tea.local:3000" "$(GITEA_HOST=http://tea.local:3000 gitea_origin tea.local:3000)" \
+  "a Gitea host override can opt into HTTP"
+glab() {
+  [[ $* == "config get api_protocol --host configured.gitlab.local" ]] && printf 'http\n'
+}
+assert_eq "http://configured.gitlab.local" \
+  "$(GITLAB_HOST="" GL_HOST="" gitlab_origin configured.gitlab.local)" \
+  "GitLab's configured API protocol is preserved"
+assert_eq "http://configured.gitlab.local" \
+  "$(GITLAB_HOST=configured.gitlab.local gitlab_origin configured.gitlab.local)" \
+  "a bare GitLab host override keeps the configured protocol"
+unset -f glab
 
 # --- ordering --------------------------------------------------------------
 
@@ -111,10 +137,20 @@ assert_eq "ghe.example.com" "$(GH_HOST=ghe.example.com github_hosts)" "GH_HOST w
 assert_eq "ghe.example.com" "$(GH_HOST="" GITHUB_HOST=ghe.example.com github_hosts)" \
   "GITHUB_HOST is honoured too"
 assert_eq "gl.example.com" "$(GITLAB_HOST=gl.example.com gitlab_hosts)" "GITLAB_HOST wins outright"
+assert_eq "gl-alias.example.com" "$(GITLAB_HOST="" GL_HOST=gl-alias.example.com gitlab_hosts)" \
+  "GL_HOST is honoured too"
 assert_eq "gitlab.com" "$(GITLAB_HOST=https://GitLab.com/ gitlab_hosts)" \
   "an explicit host is normalized like any other"
 assert_eq "tea.example.com" "$(GITEA_HOST=https://Tea.example.com/ gitea_hosts)" \
   "GITEA_HOST wins outright and is normalized"
+
+gh() { printf 'host-specific-token\n'; }
+assert_eq "host-specific-token" "$(GH_TOKEN=ghtoken GH_HOST=http://ghe.example.com github_token ghe.example.com)" \
+  "a github.com token is not sent to an enterprise host"
+unset -f gh
+assert_eq "gltoken" \
+  "$(GITLAB_TOKEN=gltoken GITLAB_HOST=http://gl.example.com gitlab_token gl.example.com)" \
+  "a token matches a scheme-bearing GitLab override"
 
 # With a config present, every host the CLI knows about is collected.
 mkdir -p "$fixtures/cfg/gh" "$fixtures/cfg/glab-cli"
@@ -137,6 +173,24 @@ assert_eq "aaa" "$(GITEA_TOKEN="" XDG_CONFIG_HOME="$fixtures/teacfg" gitea_token
   "each Gitea host gets its own token"
 assert_eq "bbb" "$(GITEA_TOKEN="" XDG_CONFIG_HOME="$fixtures/teacfg" gitea_token tea.example.org)" \
   "a trailing slash in the config does not hide the match"
+sed 's#https://git.example.com#http://git.example.com#' "$fixtures/tea.yml" >"$fixtures/teacfg/tea/config.yml"
+assert_eq "http://git.example.com" \
+  "$(GITEA_HOST="" XDG_CONFIG_HOME="$fixtures/teacfg" gitea_origin git.example.com)" \
+  "the HTTP origin in tea config is preserved"
+assert_eq "http://git.example.com" \
+  "$(GITEA_HOST=git.example.com XDG_CONFIG_HOME="$fixtures/teacfg" gitea_origin git.example.com)" \
+  "a bare Gitea host override keeps the configured protocol"
+assert_eq "https://git.example.com" \
+  "$(GITEA_HOST=https://git.example.com XDG_CONFIG_HOME="$fixtures/teacfg" gitea_origin git.example.com)" \
+  "an explicit Gitea scheme takes precedence over tea config"
+sed 's#https://git.example.com#http://git.example.com/Code/#' "$fixtures/tea.yml" >"$fixtures/teacfg/tea/config.yml"
+assert_eq "http://git.example.com/Code" \
+  "$(GITEA_HOST="" XDG_CONFIG_HOME="$fixtures/teacfg" gitea_origin git.example.com/Code)" \
+  "a Gitea subpath is preserved in the base URL"
+assert_eq "aaa" \
+  "$(GITEA_TOKEN="" GITEA_HOST="" XDG_CONFIG_HOME="$fixtures/teacfg" gitea_token git.example.com/Code)" \
+  "credentials match the Gitea installation's subpath"
+cp "$fixtures/tea.yml" "$fixtures/teacfg/tea/config.yml"
 GITEA_TOKEN="" XDG_CONFIG_HOME="$fixtures/teacfg" gitea_token nope.example.com >/dev/null
 assert_eq "1" "$?" "an unknown Gitea host has no token"
 assert_eq "envtoken" "$(GITEA_TOKEN=envtoken XDG_CONFIG_HOME="$fixtures/teacfg" gitea_token anything)" \

@@ -189,6 +189,41 @@ Item {
     }
   }
 
+  function normalizeOrganizations(list) {
+    if (!Array.isArray(list)) return []
+    var organizations = []
+    for (var i = 0; i < list.length; i++) {
+      var raw = list[i] || {}
+      var sourceMembers = Array.isArray(raw.members) ? raw.members : []
+      var members = []
+      for (var j = 0; j < sourceMembers.length; j++) {
+        var member = sourceMembers[j] || {}
+        members.push({
+          username: String(member.username || ""),
+          displayName: String(member.displayName || ""),
+          url: String(member.url || ""),
+          pushes: Number(member.pushes || 0),
+          latestAt: String(member.latestAt || ""),
+          latestRepository: String(member.latestRepository || ""),
+          latestRef: String(member.latestRef || ""),
+          latestUrl: String(member.latestUrl || "")
+        })
+      }
+      organizations.push({
+        name: String(raw.name || ""),
+        displayName: String(raw.displayName || ""),
+        description: String(raw.description || ""),
+        webUrl: String(raw.webUrl || ""),
+        recentPushes: Number(raw.recentPushes || 0),
+        activityAvailable: raw.activityAvailable !== false,
+        membersAvailable: raw.membersAvailable !== false,
+        latestAt: String(raw.latestAt || ""),
+        members: members
+      })
+    }
+    return organizations
+  }
+
   function normalizeProvider(raw) {
     var record = raw || {}
     var kind = String(record.kind || "")
@@ -216,6 +251,7 @@ Item {
       authoredPrs: normalizeItems(record.authoredPrs),
       assignedIssues: normalizeItems(record.assignedIssues),
       authoredIssues: normalizeItems(record.authoredIssues),
+      organizations: normalizeOrganizations(record.organizations),
       totals: record.totals && typeof record.totals === "object" ? record.totals : ({})
     }
   }

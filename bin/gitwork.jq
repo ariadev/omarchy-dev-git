@@ -99,7 +99,7 @@ def other_author($author; $viewer):
   if ($author | length) == 0 or ($author | ascii_downcase) == ($viewer | ascii_downcase)
   then "" else $author end;
 
-def base_provider($kind; $host; $is_default):
+def base_provider($kind; $host; $origin; $is_default):
   { key: ($kind + "@" + $host),
     kind: $kind,
     name: (if $kind == "github" then "GitHub"
@@ -113,7 +113,7 @@ def base_provider($kind; $host; $is_default):
     staleAt: "",
     username: "",
     displayName: "",
-    webUrl: ("https://" + $host),
+    webUrl: $origin,
     userUrl: "",
     authHelpText: "",
     error: "",
@@ -127,6 +127,7 @@ def base_provider($kind; $host; $is_default):
     authoredPrs: [],
     assignedIssues: [],
     authoredIssues: [],
+    organizations: [],
     totals: {} };
 
 def github_items($nodes; $viewer):
@@ -169,20 +170,76 @@ def gitlab_issue_items($rows; $viewer):
       review: "",
       comments: (.user_notes_count // 0) } ];
 
+# Keep fallback links on the configured authority without duplicating a
+# reverse proxy's subpath already present in the API-provided URL.
+def rewrite_origin($url; $origin):
+  ($url // "") as $value
+  | if ($value | test("^https?://"))
+    then ($origin | capture("^(?<authority>https?://[^/]+)").authority) as $authority
+      | ($value | sub("^https?://[^/]+"; $authority))
+    else $value
+    end;
+
 # Gitea's issue search answers pulls and issues from one endpoint and one row
 # shape, so both queues share this. It reports no review decision anywhere in
 # the search response, so `review` stays empty rather than guessing.
-def gitea_items($rows; $viewer):
+def gitea_items($rows; $viewer; $origin):
   [ $rows[]? | select((.html_url // "") != "") |
     { number: (.number // 0),
       title: (.title // ""),
       repository: (.repository.full_name // ""),
-      url: .html_url,
+      url: (if (.repository.full_name // "") != "" and (.number // 0) > 0
+            then $origin + "/" + (.repository.full_name | split("/") | map(@uri) | join("/"))
+                 + (if .pull_request != null then "/pulls/" else "/issues/" end)
+                 + (.number | tostring)
+            else rewrite_origin(.html_url; $origin) end),
       updatedAt: (.updated_at // ""),
       draft: (.pull_request.draft // false),
       author: other_author((.user.login // ""); $viewer),
       review: "",
       comments: (.comments // 0) } ];
+
+# The organization feed is a bounded stream of recent events, not a lifetime
+# contribution total. Join its push events to the complete member roster so a
+# quiet member still appears, then sort frequent contributors to the top.
+def gitea_org_members($members; $events; $origin):
+  [ $events[]? | select(.op_type == "commit_repo") ] as $pushes
+  | ([ $members[]? |
+        { username: (.login // .username // ""),
+          displayName: (.full_name // "") } ]
+     + [ $pushes[]?.act_user |
+         { username: (.login // .username // ""),
+           displayName: (.full_name // "") } ])
+  | map(select(.username != ""))
+  | unique_by(.username | ascii_downcase)
+  | map(
+      . as $user
+      | [ $pushes[]? |
+          select(((.act_user.login // .act_user.username // "") | ascii_downcase)
+                 == ($user.username | ascii_downcase)) ] as $mine
+      | ($mine | sort_by(.created // "") | last // {}) as $latest
+      | $user + {
+          url: ($origin + "/" + ($user.username | @uri)),
+          pushes: ($mine | length),
+          latestAt: ($latest.created // ""),
+          latestRepository: ($latest.repo.full_name // ""),
+          latestRef: (($latest.ref_name // "") | sub("^refs/heads/"; "")),
+          latestUrl: (if ($latest.repo.full_name // "") == "" then ""
+                      else ($origin + "/" + ($latest.repo.full_name | split("/") | map(@uri) | join("/")))
+                      end)
+        })
+  | sort_by([-(.pushes), (.username | ascii_downcase)]);
+
+def gitea_organization($org; $members; $events; $origin):
+  ($org.username // $org.name // "") as $name
+  | [ $events[]? | select(.op_type == "commit_repo") ] as $pushes
+  | { name: $name,
+      displayName: ($org.full_name // ""),
+      description: ($org.description // ""),
+      webUrl: (if $name == "" then "" else ($origin + "/" + ($name | @uri)) end),
+      recentPushes: ($pushes | length),
+      latestAt: (($pushes | sort_by(.created // "") | last // {}).created // ""),
+      members: gitea_org_members($members; $pushes; $origin) };
 
 def counts_from_github_calendar:
   [ .weeks[]?.contributionDays[]? | {key: .date, value: .contributionCount} ]

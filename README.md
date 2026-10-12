@@ -2,7 +2,8 @@
 
 A native [Omarchy](https://omarchy.org) shell bar widget that watches GitHub,
 GitLab and Gitea for open work: a full-year contribution graph, review queues,
-and your own pull and merge requests, all in one panel.
+your own pull and merge requests, and recent Gitea organization activity, all
+in one panel.
 
 ![The dev.git panel showing the GitHub and GitLab tabs side by side](preview.png)
 
@@ -13,6 +14,11 @@ and your own pull and merge requests, all in one panel.
 - **Multiple hosts per provider** — GitHub Enterprise and self-managed GitLab
   and Gitea are discovered from `gh`/`glab`/`tea` config, each with its own
   identity, graph and queues, behind a host switch inside the tab
+- **Gitea organization activity** — every visible organization member is
+  listed and ranked by push events in the recent organization feed, with the
+  latest repository and activity age; quiet members remain visible. Counts
+  cover the first feed page (up to 100 events), not a fixed time period or
+  lifetime total
 - **Open-work grid** — awaiting review, assigned PRs/MRs, assigned and authored
   issues; each click opens the pre-filtered queue page
 - **Queue rows** carrying draft tag, approval check, comment count, repository,
@@ -32,6 +38,14 @@ signed in — the collector reads the credentials those CLIs already hold and
 never stores a token of its own. All three are optional: each provider is
 collected independently, so a missing or unauthenticated one never hides the
 others.
+
+Self-hosted instances may use plain HTTP for local development. Configure the
+CLI with an `http://` URL (for example, `tea login add --url
+http://localhost:3000` or `glab auth login --hostname localhost:3000
+--api-protocol http`) and the collector will preserve that scheme. HTTPS
+remains the default for hosts that do not explicitly select HTTP.
+Gitea URLs can also include a reverse-proxy subpath, such as
+`https://git.example.com/Code`.
 
 Nothing is compiled or installed. Clone it and it runs.
 
@@ -76,7 +90,15 @@ for issues, and the events feed for the calendar — it has no calendar API — 
 page one reporting the page count so the rest are fetched together. Gitea has no
 GraphQL at all, but its issue search takes each queue as query parameters and
 answers pulls and issues from one row shape, so identity comes first and then
-the five queues and the heatmap fly together.
+the five queues, heatmap, visible organization rosters and recent organization
+feeds fly together. Gitea browser links use the base URL configured in `tea`,
+including its scheme, port and subpath.
+
+Organization and member lists are paginated, with a 40-page safety limit per
+list and at most eight organization requests in flight per host. Visibility
+follows the signed-in account's permissions. A missing or restricted organization
+API leaves the personal queues working; unavailable feeds and incomplete member
+lists are labeled in the panel instead of being presented as quiet activity.
 
 Every host is collected in its own subshell, so a run costs the slowest single
 host rather than the sum of them. A host that cannot be reached carries its last
@@ -91,6 +113,7 @@ is genuinely gone.
 | `refreshIntervalSec`       | integer | 300     | Collector run interval (s) |
 | `providers.github.enabled` | boolean | true    | Show the GitHub tab        |
 | `providers.gitlab.enabled` | boolean | true    | Show the GitLab tab        |
+| `providers.gitea.enabled`  | boolean | true    | Show the Gitea tab         |
 
 ## Tests
 
@@ -98,8 +121,8 @@ is genuinely gone.
 ./tests/run.sh
 ```
 
-No network or credentials required — every host the suite touches is
-deliberately unreachable.
+No network or credentials required — requests use stub responses or
+deliberately unreachable hosts.
 
 ## License
 

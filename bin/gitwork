@@ -15,6 +15,7 @@ set -uo pipefail
 readonly SCHEMA_VERSION=3
 readonly STALE_WINDOW_SEC=$((6 * 3600))
 readonly GITLAB_PAGE_CAP=40
+readonly GITEA_PAGE_CAP=40
 LIB_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly LIB_DIR
 
@@ -100,9 +101,11 @@ yaml_keys_at() {
 # order — discovery order is display order in the panel.
 dedupe() {
   awk '{
-    v = tolower($0)
-    sub(/^https?:\/\//, "", v)
+    v = $0
+    sub(/^[Hh][Tt][Tt][Pp][Ss]?:\/\//, "", v)
     sub(/\/+$/, "", v)
+    slash = index(v, "/")
+    v = slash ? tolower(substr(v, 1, slash - 1)) substr(v, slash) : tolower(v)
     if (v != "" && !(v in seen)) { seen[v] = 1; print v }
   }'
 }
@@ -125,8 +128,8 @@ github_hosts() {
 }
 
 gitlab_hosts() {
-  local path raw
-  if [[ -n ${GITLAB_HOST:-} ]]; then printf '%s\n' "$GITLAB_HOST" | dedupe; return; fi
+  local path raw override=${GITLAB_HOST:-${GL_HOST:-}}
+  if [[ -n $override ]]; then printf '%s\n' "$override" | dedupe; return; fi
   path="$(config_home)/glab-cli/config.yml"
   raw=$(yaml_keys_at "$path" hosts 4 | dedupe)
   [[ -n $raw ]] || raw=$(yaml_keys_at "$path" hosts 2 | dedupe)
@@ -175,6 +178,62 @@ gitea_hosts() {
   primary=$(tea_logins | awk -F'\t' '$3 == "true" {print $1; exit}' | dedupe)
   mapfile -t hosts <<<"$raw"
   order_default_first "$primary" "${hosts[@]}"
+}
+
+# Keep the host as the stable identity used for credentials and display, while
+# carrying an explicitly configured scheme separately for API and browser URLs.
+# HTTPS remains the default; HTTP is used only when a CLI or host override says
+# so explicitly.
+origin_from() {
+  local raw=$1 host=$2
+  case "${raw,,}" in
+    http://*) printf 'http://%s\n' "$host" ;;
+    *) printf 'https://%s\n' "$host" ;;
+  esac
+}
+
+origin_matches_host() {
+  local raw=$1 host=$2
+  [[ "$(printf '%s\n' "$raw" | dedupe)" == "$host" ]]
+}
+
+github_origin() {
+  local host=$1 raw=${GH_HOST:-${GITHUB_HOST:-}}
+  if [[ ${raw,,} == http://* || ${raw,,} == https://* ]] && origin_matches_host "$raw" "$host"; then
+    origin_from "$raw" "$host"
+  else
+    printf 'https://%s\n' "$host"
+  fi
+}
+
+gitlab_origin() {
+  local host=$1 raw=${GITLAB_HOST:-${GL_HOST:-}} protocol=""
+  if [[ ${raw,,} == http://* || ${raw,,} == https://* ]] && origin_matches_host "$raw" "$host"; then
+    origin_from "$raw" "$host"
+    return
+  fi
+  if have glab; then
+    protocol=$(glab config get api_protocol --host "$host" 2>/dev/null | head -n 1)
+  fi
+  if [[ ${protocol,,} == http ]]; then
+    printf 'http://%s\n' "$host"
+  else
+    printf 'https://%s\n' "$host"
+  fi
+}
+
+gitea_origin() {
+  local host=$1 raw=${GITEA_HOST:-} url _token _default
+  if [[ ${raw,,} == http://* || ${raw,,} == https://* ]] && origin_matches_host "$raw" "$host"; then
+    origin_from "$raw" "$host"
+    return
+  fi
+  while IFS=$'\t' read -r url _token _default; do
+    origin_matches_host "$url" "$host" || continue
+    origin_from "$url" "$host"
+    return
+  done < <(tea_logins)
+  printf 'https://%s\n' "$host"
 }
 
 # ---------------------------------------------------------------------------
@@ -278,9 +337,10 @@ fragment issue on Issue {
 GQL
 
 github_endpoint() {
-  case "$1" in
+  local host=$1 origin=$2
+  case "$host" in
     github.com|api.github.com) echo "https://api.github.com/graphql" ;;
-    *) echo "https://$1/api/graphql" ;;
+    *) echo "$origin/api/graphql" ;;
   esac
 }
 
@@ -299,18 +359,20 @@ github_token() {
 # Emit a provider that never got off the ground: no data, just the hint that
 # tells the user which command fixes it.
 unready_provider() {
-  local kind=$1 host=$2 is_default=$3 help=$4 err=$5 elapsed=$6
+  local kind=$1 host=$2 origin=$3 is_default=$4 help=$5 err=$6 elapsed=$7
   jqm -n --arg kind "$kind" --arg host "$host" --argjson isdefault "$is_default" \
-    --arg help "$help" --arg err "$err" --arg at "$(now_iso)" --argjson ms "$elapsed" \
+    --arg origin "$origin" --arg help "$help" --arg err "$err" \
+    --arg at "$(now_iso)" --argjson ms "$elapsed" \
     'include "gitwork";
-     base_provider($kind; $host; $isdefault)
+     base_provider($kind; $host; $origin; $isdefault)
      + {authHelpText: $help, error: $err, updatedAt: $at, elapsedMs: $ms}'
 }
 
 collect_github() {
   local host=$1 is_default=$2 out=$3
-  local started token status help
+  local started token status help origin
   started=$(now_ms)
+  origin=$(github_origin "$host")
   ERR_FILE="$tmp/gh-$host.err"; : >"$ERR_FILE"
 
   token=$(github_token "$host"); rc=$?
@@ -320,45 +382,45 @@ collect_github() {
     else
       help="Not signed in to $host. Run: gh auth login --hostname $host"
     fi
-    unready_provider github "$host" "$is_default" "$help" "" $(( $(now_ms) - started )) >"$out"
+    unready_provider github "$host" "$origin" "$is_default" "$help" "" $(( $(now_ms) - started )) >"$out"
     return
   fi
   if [[ -z $token ]]; then
-    unready_provider github "$host" "$is_default" \
+    unready_provider github "$host" "$origin" "$is_default" \
       "Not signed in to $host. Run: gh auth login --hostname $host" "" $(( $(now_ms) - started )) >"$out"
     return
   fi
 
   AUTH_HEADER=(-H "Authorization: bearer $token")
   jq -n --arg q "$GITHUB_QUERY" '{query: $q}' >"$tmp/gh-$host.payload"
-  status=$(http_graphql "$(github_endpoint "$host")" "$tmp/gh-$host.payload" "$tmp/gh-$host.json")
+  status=$(http_graphql "$(github_endpoint "$host" "$origin")" "$tmp/gh-$host.payload" "$tmp/gh-$host.json")
 
   if [[ $status == 401 || $status == 403 ]]; then
-    unready_provider github "$host" "$is_default" \
+    unready_provider github "$host" "$origin" "$is_default" \
       "Token rejected by $host. Run: gh auth login --hostname $host" "" $(( $(now_ms) - started )) >"$out"
     return
   fi
   if [[ $status != 2* ]] || ! jq -e . "$tmp/gh-$host.json" >/dev/null 2>&1; then
-    unready_provider github "$host" "$is_default" "Could not reach $host." \
+    unready_provider github "$host" "$origin" "$is_default" "Could not reach $host." \
       "$(github_error "$status" "$tmp/gh-$host.json")" $(( $(now_ms) - started )) >"$out"
     return
   fi
   # GraphQL reports its own errors with HTTP 200, so they never surface above.
   if jq -e '(.errors // []) | length > 0' "$tmp/gh-$host.json" >/dev/null 2>&1; then
-    unready_provider github "$host" "$is_default" "Could not reach $host." \
+    unready_provider github "$host" "$origin" "$is_default" "Could not reach $host." \
       "graphql: $(jq -r '[.errors[].message] | join("; ")' "$tmp/gh-$host.json")" \
       $(( $(now_ms) - started )) >"$out"
     return
   fi
 
-  jqm --arg host "$host" --argjson isdefault "$is_default" --arg at "$(now_iso)" \
+  jqm --arg host "$host" --arg origin "$origin" --argjson isdefault "$is_default" --arg at "$(now_iso)" \
     --argjson ms $(( $(now_ms) - started )) \
     --argjson start "$CAL_START" --argjson days "$CAL_DAYS" \
     'include "gitwork";
      .data as $gh
      | ($gh.viewer.login // "") as $viewer
      | ($gh.viewer.contributionsCollection.contributionCalendar) as $cc
-     | base_provider("github"; $host; $isdefault)
+     | base_provider("github"; $host; $origin; $isdefault)
      + { ready: true,
          updatedAt: $at,
          elapsedMs: $ms,
@@ -367,7 +429,7 @@ collect_github() {
          userUrl: ($gh.viewer.url // ""),
          webUrl: (if ($gh.viewer.url // "") != ""
                   then ($gh.viewer.url | rtrimstr("/" + $viewer))
-                  else ("https://" + $host) end),
+                  else $origin end),
          calendar: build_calendar($start; $days; ($cc | counts_from_github_calendar);
                                   ($cc.totalContributions // 0)),
          reviewRequests: github_items($gh.reviewRequests.nodes; $viewer),
@@ -383,7 +445,7 @@ collect_github() {
          ["authoredIssues", ($gh.authoredIssues.issueCount // 0), (.authoredIssues | length)]]) }
     ' "$tmp/gh-$host.json" >"$out" 2>>"$ERR_FILE"
 
-  [[ -s $out ]] || unready_provider github "$host" "$is_default" \
+  [[ -s $out ]] || unready_provider github "$host" "$origin" "$is_default" \
     "Could not read the response from $host." "invalid API response" \
     $(( $(now_ms) - started )) >"$out"
 }
@@ -420,8 +482,8 @@ fragment mr on MergeRequest {
 GQL
 
 gitlab_token() {
-  local host=$1
-  if [[ -n ${GITLAB_TOKEN:-} && $host == "${GITLAB_HOST:-}" ]]; then
+  local host=$1 override=${GITLAB_HOST:-${GL_HOST:-}}
+  if [[ -n ${GITLAB_TOKEN:-} && -n $override ]] && origin_matches_host "$override" "$host"; then
     printf '%s\n' "$GITLAB_TOKEN"; return 0
   fi
   have glab || return 2
@@ -484,6 +546,7 @@ collect_gitlab() {
   local host=$1 is_default=$2 out=$3
   local started token status base help
   started=$(now_ms)
+  base=$(gitlab_origin "$host")
   ERR_FILE="$tmp/gl-$host.err"; : >"$ERR_FILE"
 
   token=$(gitlab_token "$host"); rc=$?
@@ -493,16 +556,15 @@ collect_gitlab() {
     else
       help="Not signed in to $host. Run: glab auth login --hostname $host"
     fi
-    unready_provider gitlab "$host" "$is_default" "$help" "" $(( $(now_ms) - started )) >"$out"
+    unready_provider gitlab "$host" "$base" "$is_default" "$help" "" $(( $(now_ms) - started )) >"$out"
     return
   fi
   if [[ -z $token ]]; then
-    unready_provider gitlab "$host" "$is_default" \
+    unready_provider gitlab "$host" "$base" "$is_default" \
       "Not signed in to $host. Run: glab auth login --hostname $host" "" $(( $(now_ms) - started )) >"$out"
     return
   fi
 
-  base="https://$host"
   AUTH_HEADER=(-H "PRIVATE-TOKEN: $token")
   jq -n --arg q "$GITLAB_QUERY" '{query: $q}' >"$tmp/gl-$host.payload"
 
@@ -516,23 +578,23 @@ collect_gitlab() {
 
   status=$(cat "$graph_status_file" 2>/dev/null)
   if [[ $status == 401 || $status == 403 ]]; then
-    unready_provider gitlab "$host" "$is_default" \
+    unready_provider gitlab "$host" "$base" "$is_default" \
       "Token rejected by $host. Run: glab auth login --hostname $host" "" $(( $(now_ms) - started )) >"$out"
     return
   fi
   if [[ $status != 2* ]] || ! jq -e . "$tmp/gl-$host.json" >/dev/null 2>&1; then
-    unready_provider gitlab "$host" "$is_default" "Could not reach $host." \
+    unready_provider gitlab "$host" "$base" "$is_default" "Could not reach $host." \
       "HTTP ${status:-000}" $(( $(now_ms) - started )) >"$out"
     return
   fi
   if jq -e '(.errors // []) | length > 0' "$tmp/gl-$host.json" >/dev/null 2>&1; then
-    unready_provider gitlab "$host" "$is_default" "Could not reach $host." \
+    unready_provider gitlab "$host" "$base" "$is_default" "Could not reach $host." \
       "graphql: $(jq -r '[.errors[].message] | join("; ")' "$tmp/gl-$host.json")" \
       $(( $(now_ms) - started )) >"$out"
     return
   fi
   if ! jq -e '(.data.currentUser.username // "") != ""' "$tmp/gl-$host.json" >/dev/null 2>&1; then
-    unready_provider gitlab "$host" "$is_default" \
+    unready_provider gitlab "$host" "$base" "$is_default" \
       "Token for $host has no user. Run: glab auth login --hostname $host" "" \
       $(( $(now_ms) - started )) >"$out"
     return
@@ -546,7 +608,8 @@ collect_gitlab() {
     issue_error=$(head -1 "$tmp/gl-$host.assigned.json.err")
   fi
 
-  jqm --arg host "$host" --arg issueError "$issue_error" --argjson isdefault "$is_default" --arg at "$(now_iso)" \
+  jqm --arg host "$host" --arg origin "$base" --arg issueError "$issue_error" \
+    --argjson isdefault "$is_default" --arg at "$(now_iso)" \
     --argjson ms $(( $(now_ms) - started )) \
     --slurpfile assigned "$tmp/gl-$host.assigned.json" \
     --slurpfile authored "$tmp/gl-$host.authored.json" \
@@ -556,7 +619,7 @@ collect_gitlab() {
     'include "gitwork";
      .data.currentUser as $u
      | ($u.username // "") as $viewer
-     | base_provider("gitlab"; $host; $isdefault)
+     | base_provider("gitlab"; $host; $origin; $isdefault)
      + { ready: true,
          updatedAt: $at,
          elapsedMs: $ms,
@@ -578,7 +641,7 @@ collect_gitlab() {
          ["authoredIssues", $authoredTotal, (.authoredIssues | length)]]) }
     ' "$tmp/gl-$host.json" >"$out" 2>>"$ERR_FILE"
 
-  [[ -s $out ]] || unready_provider gitlab "$host" "$is_default" \
+  [[ -s $out ]] || unready_provider gitlab "$host" "$base" "$is_default" \
     "Could not read the response from $host." "invalid API response" \
     $(( $(now_ms) - started )) >"$out"
 }
@@ -631,45 +694,136 @@ gitea_search() {
   header_value "$out.head" "X-Total-Count" | grep -E '^[0-9]+$' >"$total_out" || echo 0 >"$total_out"
 }
 
+# Fetch an optional array endpoint, keeping failure distinct from an empty list.
+gitea_array() {
+  local url=$1 out=$2 status
+  status=$(http_get "$url" "$out" "$out.head")
+  if [[ $status != 2* ]] || ! jq -e 'type == "array"' "$out" >/dev/null 2>&1; then
+    echo '[]' >"$out"
+    printf 'HTTP %s or invalid response\n' "${status:-000}" >"$out.err"
+    return 1
+  fi
+  rm -f "$out.err"
+}
+
+# Follow pagination on our configured base URL, never an advertised internal
+# address. The server may cap page sizes below the requested limit. A failed or
+# capped traversal must not masquerade as a complete roster.
+gitea_list() {
+  local url=$1 out=$2 page count link total seen=0
+  local -a pages=()
+  for ((page = 1; page <= GITEA_PAGE_CAP; page++)); do
+    if ! gitea_array "$url?limit=50&page=$page" "$out.page-$page"; then
+      cp "$out.page-$page.err" "$out.err"
+      echo '[]' >"$out"
+      return 1
+    fi
+    pages+=("$out.page-$page")
+    count=$(jq 'length' "$out.page-$page")
+    seen=$((seen + count))
+    link=$(header_value "$out.page-$page.head" Link)
+    total=$(header_value "$out.page-$page.head" X-Total-Count)
+    if ((count == 0)) || { [[ -n $link && $link != *'rel="next"'* ]]; } \
+        || { [[ $total =~ ^[0-9]+$ ]] && ((seen >= total)); }; then
+      jq -s 'add // []' "${pages[@]}" >"$out"
+      rm -f "$out.err"
+      return 0
+    fi
+  done
+  echo '[]' >"$out"
+  echo 'pagination limit reached' >"$out.err"
+  return 1
+}
+
+# Discover the signed-in account's organizations and visible members. Feeds
+# intentionally cover only the first page (up to 100 recent events). Older
+# servers and restricted tokens must not blank the calendar or work queues.
+gitea_organizations() {
+  local base=$1 prefix=$2 count index org encoded activity_available members_available
+  local -a organization_files=()
+
+  if ! gitea_list "$base/api/v1/user/orgs" "$prefix.organizations.source.json"; then
+    echo '[]' >"$prefix.organizations.json"
+    return
+  fi
+
+  count=$(jq 'length' "$prefix.organizations.source.json")
+  for ((index = 0; index < count; index++)); do
+    jq ".[$index]" "$prefix.organizations.source.json" >"$prefix.organization.$index.meta.json"
+    org=$(jq -r '.username // .name // empty' "$prefix.organization.$index.meta.json")
+    encoded=$(jq -nr --arg value "$org" '$value | @uri')
+
+    ( gitea_list "$base/api/v1/orgs/$encoded/members" "$prefix.organization.$index.members.json" ) &
+    ( gitea_array "$base/api/v1/orgs/$encoded/activities/feeds?limit=100" \
+        "$prefix.organization.$index.feed.json" ) &
+    # Bound concurrent requests for accounts belonging to many organizations.
+    (((index + 1) % 4 == 0)) && wait
+  done
+  wait
+
+  for ((index = 0; index < count; index++)); do
+    activity_available=true; members_available=true
+    [[ -f $prefix.organization.$index.feed.json.err ]] && activity_available=false
+    [[ -f $prefix.organization.$index.members.json.err ]] && members_available=false
+    jqm -n --arg origin "$base" \
+      --argjson activityAvailable "$activity_available" --argjson membersAvailable "$members_available" \
+      --slurpfile org "$prefix.organization.$index.meta.json" \
+      --slurpfile members "$prefix.organization.$index.members.json" \
+      --slurpfile events "$prefix.organization.$index.feed.json" \
+      'include "gitwork"; gitea_organization($org[0]; $members[0]; $events[0]; $origin)
+       + {activityAvailable: $activityAvailable, membersAvailable: $membersAvailable}' \
+      >"$prefix.organization.$index.json"
+    organization_files+=("$prefix.organization.$index.json")
+  done
+
+  if ((${#organization_files[@]})); then
+    jq -s '.' "${organization_files[@]}" >"$prefix.organizations.json"
+  else
+    echo '[]' >"$prefix.organizations.json"
+  fi
+}
+
 collect_gitea() {
   local host=$1 is_default=$2 out=$3
   local started token status base help prefix entry name params rc
   started=$(now_ms)
-  prefix="$tmp/gt-$host"
+  base=$(gitea_origin "$host")
+  prefix="$tmp/gt-$(printf '%s' "$host" | jq -sRr @uri)"
   ERR_FILE="$prefix.err"; : >"$ERR_FILE"
 
   token=$(gitea_token "$host"); rc=$?
   if ((rc != 0)) || [[ -z $token ]]; then
     if ((rc == 2)); then
-      help="Gitea CLI not found. Install \`tea\`, then run: tea login add --url https://$host"
+      help="Gitea CLI not found. Install \`tea\`, then run: tea login add --url $base"
     else
-      help="Not signed in to $host. Run: tea login add --url https://$host"
+      help="Not signed in to $host. Run: tea login add --url $base"
     fi
-    unready_provider gitea "$host" "$is_default" "$help" "" $(( $(now_ms) - started )) >"$out"
+    unready_provider gitea "$host" "$base" "$is_default" "$help" "" $(( $(now_ms) - started )) >"$out"
     return
   fi
 
-  base="https://$host"
   AUTH_HEADER=(-H "Authorization: token $token")
 
   status=$(http_get "$base/api/v1/user" "$prefix.user.json" "$prefix.user.head")
   if [[ $status == 401 || $status == 403 ]]; then
-    unready_provider gitea "$host" "$is_default" \
+    unready_provider gitea "$host" "$base" "$is_default" \
       "Token rejected by $host. Run: tea login add --url $base" "" $(( $(now_ms) - started )) >"$out"
     return
   fi
   if [[ $status != 2* ]] || ! jq -e '(.login // "") != ""' "$prefix.user.json" >/dev/null 2>&1; then
-    unready_provider gitea "$host" "$is_default" "Could not reach $host." \
+    unready_provider gitea "$host" "$base" "$is_default" "Could not reach $host." \
       "HTTP ${status:-000}" $(( $(now_ms) - started )) >"$out"
     return
   fi
   local viewer
   viewer=$(jq -r '.login' "$prefix.user.json")
 
-  # Six independent requests, so they go together rather than in turn.
+  # The calendar, organizations and five queues are independent, so they go
+  # together rather than in turn.
   ( http_get "$base/api/v1/users/$(printf '%s' "$viewer" | jq -sRr @uri)/heatmap" \
       "$prefix.heatmap.json" "$prefix.heatmap.head" >/dev/null
     jq -e 'type == "array"' "$prefix.heatmap.json" >/dev/null 2>&1 || echo '[]' >"$prefix.heatmap.json" ) &
+  ( gitea_organizations "$base" "$prefix" ) &
   for entry in "${GITEA_QUEUES[@]}"; do
     name=${entry%%:*}; params=${entry#*:}
     ( gitea_search "$base" "$name" "$params" "$prefix.$name.json" "$prefix.$name.total" ) &
@@ -685,7 +839,7 @@ collect_gitea() {
   done
   ((failures == ${#GITEA_QUEUES[@]})) && queue_error=$(head -1 "$prefix.reviewRequests.json.err")
 
-  jqm -n --arg host "$host" --arg viewer "$viewer" --arg queueError "$queue_error" \
+  jqm -n --arg host "$host" --arg origin "$base" --arg viewer "$viewer" --arg queueError "$queue_error" \
     --argjson isdefault "$is_default" --arg at "$(now_iso)" \
     --argjson ms $(( $(now_ms) - started )) \
     --argjson start "$CAL_START" --argjson days "$CAL_DAYS" \
@@ -696,6 +850,7 @@ collect_gitea() {
     --slurpfile authoredPrs "$prefix.authoredPrs.json" \
     --slurpfile assignedIssues "$prefix.assignedIssues.json" \
     --slurpfile authoredIssues "$prefix.authoredIssues.json" \
+    --slurpfile organizations "$prefix.organizations.json" \
     --argjson reviewRequestsTotal "$(cat "$prefix.reviewRequests.total" 2>/dev/null || echo 0)" \
     --argjson assignedPrsTotal "$(cat "$prefix.assignedPrs.total" 2>/dev/null || echo 0)" \
     --argjson authoredPrsTotal "$(cat "$prefix.authoredPrs.total" 2>/dev/null || echo 0)" \
@@ -703,20 +858,21 @@ collect_gitea() {
     --argjson authoredIssuesTotal "$(cat "$prefix.authoredIssues.total" 2>/dev/null || echo 0)" \
     'include "gitwork";
      $user[0] as $u
-     | base_provider("gitea"; $host; $isdefault)
+     | base_provider("gitea"; $host; $origin; $isdefault)
      + { ready: true,
          updatedAt: $at,
          elapsedMs: $ms,
          error: $queueError,
          username: $viewer,
          displayName: ($u.full_name // ""),
-         userUrl: ("https://" + $host + "/" + $viewer),
+         userUrl: ($origin + "/" + $viewer),
          calendar: build_calendar($start; $days; ($heatmap[0] | counts_from_gitea_heatmap); 0),
-         reviewRequests: gitea_items($reviewRequests[0]; $viewer),
-         assignedPrs: gitea_items($assignedPrs[0]; $viewer),
-         authoredPrs: gitea_items($authoredPrs[0]; $viewer),
-         assignedIssues: gitea_items($assignedIssues[0]; $viewer),
-         authoredIssues: gitea_items($authoredIssues[0]; $viewer) }
+         organizations: $organizations[0],
+         reviewRequests: gitea_items($reviewRequests[0]; $viewer; $origin),
+         assignedPrs: gitea_items($assignedPrs[0]; $viewer; $origin),
+         authoredPrs: gitea_items($authoredPrs[0]; $viewer; $origin),
+         assignedIssues: gitea_items($assignedIssues[0]; $viewer; $origin),
+         authoredIssues: gitea_items($authoredIssues[0]; $viewer; $origin) }
      | . + { totals: totals([
          ["reviewRequests", $reviewRequestsTotal, (.reviewRequests | length)],
          ["assignedPrs",    $assignedPrsTotal,    (.assignedPrs | length)],
@@ -725,7 +881,7 @@ collect_gitea() {
          ["authoredIssues", $authoredIssuesTotal, (.authoredIssues | length)]]) }
     ' >"$out" 2>>"$ERR_FILE"
 
-  [[ -s $out ]] || unready_provider gitea "$host" "$is_default" \
+  [[ -s $out ]] || unready_provider gitea "$host" "$base" "$is_default" \
     "Could not read the response from $host." "invalid API response" \
     $(( $(now_ms) - started )) >"$out"
 }
