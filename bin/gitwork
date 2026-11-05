@@ -786,7 +786,14 @@ fi
 
 previous='null'
 if [[ -n $output && -r $output ]]; then
-  previous=$(jq -c . "$output" 2>/dev/null || echo 'null')
+  # A malformed overview must not brick the collector. jq prints the valid
+  # prefix of its input to stdout before it fails, so `previous=$(jq ... ||
+  # echo null)` would splice that prefix onto a literal null and hand --argjson
+  # invalid text, aborting every run until the file is deleted by hand. Read it
+  # in a statement of its own and keep the result only when jq succeeded.
+  if parsed=$(jq -c . "$output" 2>/dev/null) && [[ -n $parsed ]]; then
+    previous=$parsed
+  fi
 fi
 
 document=$(jqm -n \

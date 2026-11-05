@@ -136,6 +136,19 @@ run_dead -output "$out" >/dev/null
 assert_eq "0" "$(jq -e . "$out" >/dev/null 2>&1; echo $?)" "a repeat run leaves valid JSON"
 assert_eq "3" "$(jq -r .schemaVersion "$out")" "a repeat run keeps the schema version"
 
+# A corrupt overview left at the output path must not brick the collector. jq
+# prints the valid prefix of its input before failing, so reading it with
+# `previous=$(jq ... || echo null)` spliced that prefix onto a literal null,
+# and every later run aborted on invalid --argjson input until the file was
+# deleted by hand. The run must recover on its own.
+printf '%s' '{"schemaVersion":3,"providers":[]}
+}' >"$out"
+run_dead -output "$out" >/dev/null
+assert_eq "0" "$(jq -e . "$out" >/dev/null 2>&1; echo $?)" \
+  "a run recovers from a corrupt previous overview"
+assert_eq "2" "$(jq -r '.providers | length' "$out")" \
+  "the recovered overview is rebuilt from the current run"
+
 # --- formatting ------------------------------------------------------------
 
 assert_eq "1" "$(run_dead -pretty false | wc -l)" "compact output is one line"
